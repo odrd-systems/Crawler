@@ -1,10 +1,13 @@
 """
 Python port of Firecrawl's core crawl-redis + scrapeURL logic.
-Requires: redis, httpx, loguru (or standard logging)
+Requires: httpx
+Optional: redis (only needed when REDIS_URL is set)
 """
 
 import asyncio
+import bisect
 import json
+import os
 import re
 import time
 import uuid
@@ -12,8 +15,6 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Optional
 from urllib.parse import urlparse, urlunparse
-
-import redis.asyncio as aioredis
 
 # ---------------------------------------------------------------------------
 # Types / Dataclasses
@@ -122,7 +123,15 @@ TTL = 24 * 60 * 60  # 24 hours in seconds
 
 class CrawlRedis:
     def __init__(self, redis_url: str = "redis://localhost:6379"):
-        self.redis: aioredis.Redis = aioredis.from_url(redis_url, decode_responses=True)
+        try:
+            import redis.asyncio as aioredis
+        except ImportError:
+            raise ImportError(
+                "The 'redis' package is required to use Redis mode.\n"
+                "Install it with:  pip install redis aioredis\n"
+                "Or unset REDIS_URL to use the built-in in-memory store."
+            ) from None
+        self.redis = aioredis.from_url(redis_url, decode_responses=True)
 
     # -- Crawl lifecycle ----------------------------------------------------
 
@@ -308,6 +317,121 @@ class CrawlRedis:
     async def record_robots_blocked(self, crawl_id: str, url: str):
         await self.redis.sadd(f"crawl:{crawl_id}:robots_blocked", url)
         await self.redis.expire(f"crawl:{crawl_id}:robots_blocked", TTL)
+
+
+# ---------------------------------------------------------------------------
+# In-memory store (local-dev fallback — no Redis required)
+# ---------------------------------------------------------------------------
+
+class CrawlMemory:
+    """In-memory crawl state store for local development (no Redis required)."""
+
+    def __init__(self):
+        self._crawls: dict[str, dict] = {}
+        self._active_crawls: set[str] = set()
+        self._jobs: dict[str, set[str]] = {}
+        self._jobs_done: dict[str, set[str]] = {}
+        self._jobs_done_ordered: dict[str, list[tuple[float, str]]] = {}
+        self._visited: dict[str, set[str]] = {}
+        self._visited_unique: dict[str, set[str]] = {}
+        self._finish: set[str] = set()
+        self._kickoff_finish: set[str] = set()
+        self._errors: dict[str, str] = {}
+        self._robots_blocked: dict[str, set[str]] = {}
+
+    async def save_crawl(self, crawl_id: str, crawl: StoredCrawl):
+        self._crawls[crawl_id] = {
+            "origin_url": crawl.origin_url,
+            "crawler_options": crawl.crawler_options.__dict__,
+            "scrape_options": crawl.scrape_options.__dict__,
+            "team_id": crawl.team_id,
+            "robots": crawl.robots,
+            "cancelled": crawl.cancelled,
+            "created_at": crawl.created_at,
+            "zero_data_retention": crawl.zero_data_retention,
+        }
+
+    async def get_crawl(self, crawl_id: str) -> Optional[dict]:
+        return self._crawls.get(crawl_id)
+
+    async def finish_crawl(self, crawl_id: str):
+        self._finish.add(crawl_id)
+        self._active_crawls.discard(crawl_id)
+        self._visited.pop(crawl_id, None)
+        self._visited_unique.pop(crawl_id, None)
+
+    async def set_crawl_error(self, crawl_id: str, error: str):
+        self._errors[crawl_id] = error
+
+    async def mark_crawl_active(self, crawl_id: str):
+        self._active_crawls.add(crawl_id)
+
+    async def add_crawl_job(self, crawl_id: str, job_id: str):
+        self._jobs.setdefault(crawl_id, set()).add(job_id)
+
+    async def add_crawl_jobs(self, crawl_id: str, job_ids: list[str]):
+        if not job_ids:
+            return
+        self._jobs.setdefault(crawl_id, set()).update(job_ids)
+
+    async def add_crawl_job_done(self, crawl_id: str, job_id: str, success: bool):
+        self._jobs_done.setdefault(crawl_id, set()).add(job_id)
+        if success:
+            bisect.insort(self._jobs_done_ordered.setdefault(crawl_id, []), (time.time(), job_id))
+
+    async def get_done_jobs_ordered(self, crawl_id: str, start=0, end=-1) -> list[str]:
+        ordered = self._jobs_done_ordered.get(crawl_id, [])
+        sliced = ordered[start:] if end == -1 else ordered[start:end + 1]
+        return [job_id for _, job_id in sliced]
+
+    async def is_crawl_finished(self, crawl_id: str) -> bool:
+        done = len(self._jobs_done.get(crawl_id, set()))
+        total = len(self._jobs.get(crawl_id, set()))
+        kickoff = crawl_id in self._kickoff_finish
+        return done == total and kickoff
+
+    async def finish_kickoff(self, crawl_id: str):
+        self._kickoff_finish.add(crawl_id)
+
+    @staticmethod
+    def normalize_url(url: str, ignore_query_params: bool = False) -> str:
+        return CrawlRedis.normalize_url(url, ignore_query_params)
+
+    @staticmethod
+    def generate_url_permutations(url: str) -> list[str]:
+        return CrawlRedis.generate_url_permutations(url)
+
+    async def lock_url(
+        self,
+        crawl_id: str,
+        url: str,
+        limit: Optional[int],
+        ignore_query_params: bool = False,
+        deduplicate_similar: bool = False,
+    ) -> bool:
+        normalized = self.normalize_url(url, ignore_query_params)
+
+        if limit is not None:
+            if len(self._visited_unique.get(crawl_id, set())) >= limit:
+                return False
+
+        visit_key = (
+            self.generate_url_permutations(normalized)[0]
+            if deduplicate_similar
+            else normalized
+        )
+
+        visited = self._visited.setdefault(crawl_id, set())
+        if visit_key in visited:
+            return False
+
+        visited.add(visit_key)
+        self._visited_unique.setdefault(crawl_id, set()).add(normalized)
+        return True
+
+    async def record_robots_blocked(self, crawl_id: str, url: str):
+        self._robots_blocked.setdefault(crawl_id, set()).add(url)
+
 
 # ---------------------------------------------------------------------------
 # URL filtering (WebCrawler.filterURL equivalent)
@@ -500,10 +624,16 @@ def extract_links(html: str, base_url: str) -> list[str]:
 
 class Crawler:
     def __init__(self,
-        redis_url: str = "redis://localhost:6379",
+        redis_url: Optional[str] = None,
         max_concurrency: int = 5,
     ):
-        self.store = CrawlRedis(redis_url)
+        resolved_url = redis_url or os.environ.get("REDIS_URL", "").strip()
+        if resolved_url:
+            self.store = CrawlRedis(resolved_url)
+            print(f"[crawler] Using Redis store at {resolved_url}")
+        else:
+            self.store = CrawlMemory()
+            print("[crawler] No REDIS_URL set — using in-memory store (local mode)")
         self.max_concurrency = max_concurrency
 
     async def start_crawl(
@@ -608,7 +738,9 @@ class Crawler:
 # ---------------------------------------------------------------------------
 
 async def main():
-    crawler = Crawler(redis_url="redis://localhost:6379", max_concurrency=3)
+    # No redis_url needed for local development — uses in-memory store by default.
+    # Set REDIS_URL env var to switch to Redis (e.g. for production).
+    crawler = Crawler(max_concurrency=3)
 
     crawl_id = await crawler.start_crawl(
         origin_url="https://example.com",
