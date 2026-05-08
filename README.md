@@ -1,166 +1,142 @@
 # Crawler
 
-Foundation Crawler — Python port of [firecrawl/firecrawl](https://github.com/firecrawl/firecrawl) core crawl engine.
+Foundation Crawler — local-first Python crawler inspired by Firecrawl.
 
-## Overview
+## Features
 
-This is a Python implementation of Firecrawl's core crawling and scraping pipeline, ported from TypeScript. It provides:
+- **No Docker required**
+- **Works in a Python virtual environment**
+- **Uses in-memory state by default**
+- **Uses Redis automatically if `REDIS_URL` is set**
+- Firecrawl-style crawl/job/dedup structure
+- Optional markdown conversion via `markdownify`
 
-- **`CrawlMemory`** — Built-in in-memory crawl state (no extra software needed, great for local dev)
-- **`CrawlRedis`** — Redis-backed crawl state management (optional, for production / persistent state)
-- **`Crawler`** — Async multi-page web crawler with bounded concurrency
-- **`scrape_url()`** — Single-URL scraper with waterfall engine fallback
-- **`UrlFilter`** — Include/exclude regex filtering, depth limiting, subdomain control
-- **`build_feature_flags()`** — Feature detection (PDF, screenshots, stealth proxy, etc.)
-- **`generate_url_permutations()`** — Smart URL deduplication (www/http/index.html variants)
+## Setup
 
-## Requirements
-
-- Python 3.11+
-- No external services required for local development (Redis is optional)
-
----
-
-## Local Setup
-
-### macOS / Linux
+### 1. Clone the repo
 
 ```bash
-# 1. Clone and enter the repo
 git clone https://github.com/odrd-systems/Crawler.git
 cd Crawler
+```
 
-# 2. Create and activate a virtual environment
+### 2. Create a virtual environment
+
+#### macOS / Linux
+
+```bash
 python3 -m venv .venv
 source .venv/bin/activate
-
-# 3. Install dependencies
-pip install -r requirements.txt
-
-# 4. (Optional) Copy the example config
-cp .env.example .env
-
-# 5. Run the example crawl
-python firecrawl_crawler.py
 ```
 
-### Windows (Command Prompt / PowerShell)
+#### Windows PowerShell
 
-```bat
-:: 1. Clone and enter the repo
-git clone https://github.com/odrd-systems/Crawler.git
-cd Crawler
-
-:: 2. Create and activate a virtual environment
+```powershell
 python -m venv .venv
-.venv\Scripts\activate
+.venv\Scripts\Activate.ps1
+```
 
-:: 3. Install dependencies
+#### Windows CMD
+
+```cmd
+python -m venv .venv
+.venv\Scripts\activate.bat
+```
+
+### 3. Install dependencies
+
+```bash
 pip install -r requirements.txt
+```
 
-:: 4. (Optional) Copy the example config
-copy .env.example .env
+## Run locally
 
-:: 5. Run the example crawl
+```bash
 python firecrawl_crawler.py
 ```
 
----
+If `REDIS_URL` is **not** set, the crawler runs in **local in-memory mode**.
 
-## Quick Start
+If `REDIS_URL` **is** set, it will use Redis automatically.
+
+## Optional `.env`
+
+Create a `.env` if you want Redis mode:
+
+```env
+REDIS_URL=redis://localhost:6379
+```
+
+If you do not set this, no Redis is needed.
+
+## Current example
+
+The built-in example crawls:
+
+```python
+origin_url="https://example.com"
+```
+
+You can change that inside `firecrawl_crawler.py` to something real, for example:
+
+```python
+origin_url="https://docs.python.org/3/"
+```
+
+## Example usage in your own script
 
 ```python
 import asyncio
 from firecrawl_crawler import Crawler, CrawlerOptions, ScrapeOptions
 
 async def main():
-    # No Redis needed — uses in-memory store by default.
     crawler = Crawler(max_concurrency=3)
 
     crawl_id = await crawler.start_crawl(
-        origin_url="https://example.com",
-        crawler_options=CrawlerOptions(max_depth=2, limit=10),
-        scrape_options=ScrapeOptions(formats=["markdown"]),
-        team_id="my-team",
+        origin_url="https://docs.python.org/3/",
+        crawler_options=CrawlerOptions(
+            max_depth=2,
+            limit=20,
+            excludes=[r"\.pdf$", r"/logout"],
+        ),
+        scrape_options=ScrapeOptions(
+            formats=["markdown", "html"],
+            timeout=30000,
+            headers={"User-Agent": "FoundationCrawler/0.1"},
+        ),
+        team_id="local-dev",
     )
 
-    docs = await crawler.run_crawl(crawl_id)
+    async def on_doc(url, doc):
+        print(url, doc.metadata)
+
+    docs = await crawler.run_crawl(crawl_id, on_document=on_doc)
     print(f"Scraped {len(docs)} pages")
 
 asyncio.run(main())
 ```
 
----
-
-## Local Mode vs Redis Mode
-
-| | Local mode (default) | Redis mode |
-|---|---|---|
-| **Setup** | Just `pip install -r requirements.txt` | Also needs a running Redis server |
-| **State persistence** | In-memory, lost on exit | Persisted in Redis with 24 h TTL |
-| **Best for** | Development, testing, one-off crawls | Production, long-running crawls |
-
-### Switching to Redis
-
-Set the `REDIS_URL` environment variable before running:
-
-```bash
-# macOS / Linux
-export REDIS_URL=redis://localhost:6379
-python firecrawl_crawler.py
-
-# Windows CMD
-set REDIS_URL=redis://localhost:6379
-python firecrawl_crawler.py
-```
-
-Install the Redis client libraries when using Redis mode:
-
-```bash
-pip install redis aioredis
-```
-
-You can also set `REDIS_URL` in your `.env` file (see `.env.example`).
-
----
-
 ## Architecture
 
-```
-Crawler.start_crawl()         → saves StoredCrawl to store (memory or Redis)
-Crawler.run_crawl()           → async queue + semaphore worker loop
-  └─ scrape_url()             → waterfall engine loop
-       └─ scrape_with_engine() → HTTP fetch (stub: add Playwright / Fire Engine)
-  └─ extract_links()          → parse <a href> from HTML
-  └─ store.lock_url()         → dedup check (memory set or Redis SET)
-```
+- `Crawler` → main crawl orchestrator
+- `scrape_url()` → single-page scraping pipeline
+- `InMemoryCrawlStore` → default local state backend
+- `RedisCrawlStore` → optional Redis backend
+- `UrlFilter` → include/exclude/depth/subdomain checks
+- `generate_url_permutations()` → dedupes `www`, `http/https`, `index.html`, etc.
 
-## Redis Key Schema
+## Current limitations
 
-> Only relevant when running in Redis mode (`REDIS_URL` is set).
+- `fetch` is the only real engine currently implemented
+- `playwright` and `fire-engine` are placeholders/stubs for future work
+- robots.txt is not yet wired in
+- screenshots / actions / advanced Firecrawl engines are not yet implemented
 
-| Key | Type | Description |
-|-----|------|-------------|
-| `crawl:<id>` | STRING | StoredCrawl JSON |
-| `crawl:<id>:jobs` | SET | All job IDs |
-| `crawl:<id>:jobs_done` | SET | Completed job IDs |
-| `crawl:<id>:jobs_donez_ordered` | ZSET | Done jobs ordered by time |
-| `crawl:<id>:visited` | SET | Deduped visited URLs |
-| `crawl:<id>:visited_unique` | SET | Canonical visited URLs |
-| `crawl:<id>:finish` | STRING | Crawl completion flag |
-| `active_crawls` | SET | Currently active crawl IDs |
+## Next upgrades
 
-## Extending
-
-- **Add real engines**: Replace `scrape_with_engine()` with Playwright, httpx, or Fire Engine calls
-- **Add HTML→Markdown**: Use `markdownify` or `html2text` in `scrape_url()` after scraping
-- **Add robots.txt**: Use Python's `urllib.robotparser` before calling `scrape_url()`
-- **Add API server**: Wrap `Crawler` with FastAPI endpoints (`/crawl`, `/scrape`, `/map`)
-
-## Origin
-
-Ported from [`firecrawl/firecrawl`](https://github.com/firecrawl/firecrawl) — Apache 2.0 licensed.
-Key source files:
-- `apps/api/src/scraper/scrapeURL/index.ts`
-- `apps/api/src/lib/crawl-redis.ts`
-- `apps/api/src/scraper/WebScraper/crawler.ts`
+Recommended next steps:
+1. Add Playwright support
+2. Add robots.txt support
+3. Add FastAPI endpoints (`/crawl`, `/scrape`, `/map`)
+4. Add file output / persistence layer
+5. Add page content extraction utilities

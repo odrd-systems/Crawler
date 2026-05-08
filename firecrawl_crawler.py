@@ -1,11 +1,18 @@
 """
-Python port of Firecrawl's core crawl-redis + scrapeURL logic.
-Requires: httpx
-Optional: redis (only needed when REDIS_URL is set)
+Foundation crawler inspired by Firecrawl.
+
+Local-first:
+- Works without Docker
+- Uses in-memory state if REDIS_URL is not set
+- Uses Redis automatically if REDIS_URL is provided
+
+Current status:
+- fetch engine works
+- Playwright / Fire Engine are stubs for future extension
+- markdown conversion is optional (enabled if markdownify is installed)
 """
 
 import asyncio
-import bisect
 import json
 import os
 import re
@@ -13,8 +20,21 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Optional
-from urllib.parse import urlparse, urlunparse
+from typing import Optional, Protocol
+from urllib.parse import urljoin, urlparse, urlunparse
+
+import httpx
+
+try:
+    import redis.asyncio as aioredis
+except Exception:
+    aioredis = None
+
+try:
+    from markdownify import markdownify as md
+except Exception:
+    md = None
+
 
 # ---------------------------------------------------------------------------
 # Types / Dataclasses
@@ -35,13 +55,14 @@ class FeatureFlag(str, Enum):
     AUDIO = "audio"
     DISABLE_ADBLOCK = "disableAdblock"
 
+
 @dataclass
 class ScrapeOptions:
     formats: list[str] = field(default_factory=lambda: ["markdown"])
     actions: list[dict] = field(default_factory=list)
     wait_for: int = 0
-    timeout: Optional[int] = None
-    proxy: Optional[str] = None  # "basic" | "stealth" | "enhanced" | "auto"
+    timeout: Optional[int] = 30000
+    proxy: Optional[str] = None
     location: Optional[str] = None
     mobile: bool = False
     skip_tls_verification: bool = True
@@ -49,11 +70,12 @@ class ScrapeOptions:
     max_age: int = 0
     headers: dict[str, str] = field(default_factory=dict)
 
+
 @dataclass
 class CrawlerOptions:
     max_crawled_links: int = 1000
-    max_depth: int = 10
-    limit: int = 10000
+    max_depth: int = 2
+    limit: int = 100
     includes: list[str] = field(default_factory=list)
     excludes: list[str] = field(default_factory=list)
     allow_backward_crawling: bool = False
@@ -62,6 +84,7 @@ class CrawlerOptions:
     ignore_robots_txt: bool = False
     deduplicate_similar_urls: bool = False
     max_discovery_depth: Optional[int] = None
+
 
 @dataclass
 class StoredCrawl:
@@ -75,6 +98,7 @@ class StoredCrawl:
     max_concurrency: Optional[int] = None
     zero_data_retention: bool = False
 
+
 @dataclass
 class Document:
     markdown: Optional[str] = None
@@ -83,11 +107,13 @@ class Document:
     metadata: dict = field(default_factory=dict)
     warning: Optional[str] = None
 
+
 @dataclass
 class ScrapeResult:
     success: bool
     document: Optional[Document] = None
     error: Optional[Exception] = None
+
 
 # ---------------------------------------------------------------------------
 # Errors
@@ -96,44 +122,244 @@ class ScrapeResult:
 class CrawlDenialError(Exception):
     pass
 
+
 class NoEnginesLeftError(Exception):
     pass
 
+
 class EngineError(Exception):
     pass
+
 
 class EngineUnsuccessfulError(EngineError):
     def __init__(self, engine: str):
         self.engine = engine
         super().__init__(f"Engine {engine} returned empty content")
 
+
 class AddFeatureError(Exception):
     def __init__(self, flags: list[FeatureFlag]):
         self.flags = flags
         super().__init__(f"Need additional features: {flags}")
 
+
 class ScrapeTimeoutError(Exception):
     pass
 
+
 # ---------------------------------------------------------------------------
-# Redis helpers  (crawl-redis.ts equivalent)
+# Store protocol
 # ---------------------------------------------------------------------------
 
-TTL = 24 * 60 * 60  # 24 hours in seconds
+TTL = 24 * 60 * 60
 
-class CrawlRedis:
-    def __init__(self, redis_url: str = "redis://localhost:6379"):
-        try:
-            import redis.asyncio as aioredis
-        except ImportError:
-            raise ImportError(
-                "The 'redis' package is required to use Redis mode.\n"
-                "Install it with:  pip install redis aioredis\n"
-                "Or unset REDIS_URL to use the built-in in-memory store."
-            ) from None
+
+class CrawlStore(Protocol):
+    async def save_crawl(self, crawl_id: str, crawl: StoredCrawl): ...
+    async def get_crawl(self, crawl_id: str) -> Optional[dict]: ...
+    async def finish_crawl(self, crawl_id: str): ...
+    async def set_crawl_error(self, crawl_id: str, error: str): ...
+    async def mark_crawl_active(self, crawl_id: str): ...
+    async def add_crawl_job(self, crawl_id: str, job_id: str): ...
+    async def add_crawl_jobs(self, crawl_id: str, job_ids: list[str]): ...
+    async def add_crawl_job_done(self, crawl_id: str, job_id: str, success: bool): ...
+    async def get_done_jobs_ordered(self, crawl_id: str, start=0, end=-1) -> list[str]: ...
+    async def is_crawl_finished(self, crawl_id: str) -> bool: ...
+    async def finish_kickoff(self, crawl_id: str): ...
+    async def lock_url(
+        self,
+        crawl_id: str,
+        url: str,
+        limit: Optional[int],
+        ignore_query_params: bool = False,
+        deduplicate_similar: bool = False,
+    ) -> bool: ...
+    async def record_robots_blocked(self, crawl_id: str, url: str): ...
+
+
+# ---------------------------------------------------------------------------
+# Shared URL helpers
+# ---------------------------------------------------------------------------
+
+def normalize_url(url: str, ignore_query_params: bool = False) -> str:
+    parsed = urlparse(url)
+    query = "" if ignore_query_params else parsed.query
+
+    fragment = parsed.fragment
+    if not fragment or len(fragment) <= 1 or not (
+        fragment.startswith("/") or fragment.startswith("!/")):
+        fragment = ""
+
+    return urlunparse((
+        parsed.scheme,
+        parsed.netloc,
+        parsed.path,
+        parsed.params,
+        query,
+        fragment,
+    ))
+
+
+def generate_url_permutations(url: str) -> list[str]:
+    parsed = urlparse(url)
+    hostname = parsed.hostname or ""
+
+    if hostname.startswith("www."):
+        hosts = [hostname, hostname[4:]]
+    else:
+        hosts = ["www." + hostname, hostname]
+
+    schemes = ["http", "https"] if parsed.scheme in ("http", "https") else [parsed.scheme]
+
+    path = parsed.path or "/"
+    if path.endswith("/"):
+        bare = path.rstrip("/") or "/"
+        paths = [path + "index.html", path + "index.php", path, bare]
+    elif path.endswith("/index.html"):
+        base = path[:-len("index.html")]
+        bare = path[:-len("/index.html")] or "/"
+        paths = [path, base + "index.php", base, bare]
+    elif path.endswith("/index.php"):
+        base = path[:-len("index.php")]
+        bare = path[:-len("/index.php")] or "/"
+        paths = [base + "index.html", path, base, bare]
+    else:
+        paths = [path + "/index.html", path + "/index.php", path + "/", path]
+
+    permutations = set()
+    for scheme in schemes:
+        for host in hosts:
+            port = f":{parsed.port}" if parsed.port else ""
+            netloc = host + port
+            for p in paths:
+                permutations.add(
+                    urlunparse((scheme, netloc, p, "", parsed.query, ""))
+                )
+
+    return list(permutations)
+
+
+# ---------------------------------------------------------------------------
+# In-memory store
+# ---------------------------------------------------------------------------
+
+class InMemoryCrawlStore:
+    def __init__(self):
+        self.crawls: dict[str, dict] = {}
+        self.active_crawls: set[str] = set()
+        self.crawls_by_team: dict[str, set[str]] = {}
+        self.jobs: dict[str, set[str]] = {}
+        self.jobs_qualified: dict[str, set[str]] = {}
+        self.jobs_done: dict[str, set[str]] = {}
+        self.jobs_done_ordered: dict[str, list[tuple[float, str]]] = {}
+        self.visited: dict[str, set[str]] = {}
+        self.visited_unique: dict[str, set[str]] = {}
+        self.robots_blocked: dict[str, set[str]] = {}
+        self.kickoff_finished: set[str] = set()
+        self.finished: set[str] = set()
+        self.errors: dict[str, str] = {}
+
+    async def save_crawl(self, crawl_id: str, crawl: StoredCrawl):
+        self.crawls[crawl_id] = {
+            "origin_url": crawl.origin_url,
+            "crawler_options": crawl.crawler_options.__dict__,
+            "scrape_options": crawl.scrape_options.__dict__,
+            "team_id": crawl.team_id,
+            "robots": crawl.robots,
+            "cancelled": crawl.cancelled,
+            "created_at": crawl.created_at,
+            "zero_data_retention": crawl.zero_data_retention,
+        }
+        self.crawls_by_team.setdefault(crawl.team_id, set()).add(crawl_id)
+
+    async def get_crawl(self, crawl_id: str) -> Optional[dict]:
+        return self.crawls.get(crawl_id)
+
+    async def finish_crawl(self, crawl_id: str):
+        self.finished.add(crawl_id)
+        self.active_crawls.discard(crawl_id)
+        crawl = self.crawls.get(crawl_id)
+        if crawl:
+            team_id = crawl.get("team_id")
+            if team_id in self.crawls_by_team:
+                self.crawls_by_team[team_id].discard(crawl_id)
+
+    async def set_crawl_error(self, crawl_id: str, error: str):
+        self.errors[crawl_id] = error
+
+    async def mark_crawl_active(self, crawl_id: str):
+        self.active_crawls.add(crawl_id)
+
+    async def add_crawl_job(self, crawl_id: str, job_id: str):
+        self.jobs.setdefault(crawl_id, set()).add(job_id)
+        self.jobs_qualified.setdefault(crawl_id, set()).add(job_id)
+
+    async def add_crawl_jobs(self, crawl_id: str, job_ids: list[str]):
+        self.jobs.setdefault(crawl_id, set()).update(job_ids)
+        self.jobs_qualified.setdefault(crawl_id, set()).update(job_ids)
+
+    async def add_crawl_job_done(self, crawl_id: str, job_id: str, success: bool):
+        self.jobs_done.setdefault(crawl_id, set()).add(job_id)
+        if success:
+            self.jobs_done_ordered.setdefault(crawl_id, []).append((time.time(), job_id))
+
+    async def get_done_jobs_ordered(self, crawl_id: str, start=0, end=-1) -> list[str]:
+        ordered = sorted(self.jobs_done_ordered.get(crawl_id, []), key=lambda x: x[0])
+        ids = [job_id for _, job_id in ordered]
+        if end == -1:
+            return ids[start:]
+        return ids[start:end + 1]
+
+    async def is_crawl_finished(self, crawl_id: str) -> bool:
+        done = len(self.jobs_done.get(crawl_id, set()))
+        total = len(self.jobs.get(crawl_id, set()))
+        kickoff = crawl_id in self.kickoff_finished
+        return done == total and kickoff
+
+    async def finish_kickoff(self, crawl_id: str):
+        self.kickoff_finished.add(crawl_id)
+
+    async def lock_url(
+        self,
+        crawl_id: str,
+        url: str,
+        limit: Optional[int],
+        ignore_query_params: bool = False,
+        deduplicate_similar: bool = False,
+    ) -> bool:
+        normalized = normalize_url(url, ignore_query_params)
+
+        if limit is not None:
+            count = len(self.visited_unique.get(crawl_id, set()))
+            if count >= limit:
+                return False
+
+        if deduplicate_similar:
+            visit_key = generate_url_permutations(normalized)[0]
+        else:
+            visit_key = normalized
+
+        crawl_visited = self.visited.setdefault(crawl_id, set())
+        if visit_key in crawl_visited:
+            return False
+
+        crawl_visited.add(visit_key)
+        self.visited_unique.setdefault(crawl_id, set()).add(normalized)
+        return True
+
+    async def record_robots_blocked(self, crawl_id: str, url: str):
+        self.robots_blocked.setdefault(crawl_id, set()).add(url)
+
+
+# ---------------------------------------------------------------------------
+# Redis store
+# ---------------------------------------------------------------------------
+
+class RedisCrawlStore:
+    def __init__(self, redis_url: str):
+        if aioredis is None:
+            raise RuntimeError("redis package is not installed")
         self.redis = aioredis.from_url(redis_url, decode_responses=True)
-
-    # -- Crawl lifecycle ----------------------------------------------------
 
     async def save_crawl(self, crawl_id: str, crawl: StoredCrawl):
         data = {
@@ -171,8 +397,6 @@ class CrawlRedis:
 
     async def mark_crawl_active(self, crawl_id: str):
         await self.redis.sadd("active_crawls", crawl_id)
-
-    # -- Job tracking -------------------------------------------------------
 
     async def add_crawl_job(self, crawl_id: str, job_id: str):
         pipe = self.redis.pipeline()
@@ -216,65 +440,6 @@ class CrawlRedis:
     async def finish_kickoff(self, crawl_id: str):
         await self.redis.set(f"crawl:{crawl_id}:kickoff:finish", "yes", ex=TTL)
 
-    # -- URL deduplication --------------------------------------------------
-
-    @staticmethod
-    def normalize_url(url: str, ignore_query_params: bool = False) -> str:
-        parsed = urlparse(url)
-        query = "" if ignore_query_params else parsed.query
-        fragment = parsed.fragment
-        if not fragment or len(fragment) <= 1 or not (
-            fragment.startswith("/") or fragment.startswith("!/")):
-            fragment = ""
-        return urlunparse((
-            parsed.scheme, parsed.netloc, parsed.path,
-            parsed.params, query, fragment
-        ))
-
-    @staticmethod
-    def generate_url_permutations(url: str) -> list[str]:
-        """
-        Generates www/no-www x http/https x slash/index.html/index.php/bare
-        permutations for robust deduplication.
-        """
-        parsed = urlparse(url)
-        hostname = parsed.hostname or ""
-
-        if hostname.startswith("www."):
-            hosts = [hostname, hostname[4:]]
-        else:
-            hosts = ["www." + hostname, hostname]
-
-        schemes = ["http", "https"] if parsed.scheme in ("http", "https") else [parsed.scheme]
-
-        path = parsed.path
-        paths: list[str] = []
-        if path.endswith("/"):
-            bare = path.rstrip("/") or "/"
-            paths = [path + "index.html", path + "index.php", path, bare]
-        elif path.endswith("/index.html"):
-            base = path[:-len("index.html")]
-            bare = path[:-len("/index.html")] or "/"
-            paths = [path, base + "index.php", base, bare]
-        elif path.endswith("/index.php"):
-            base = path[:-len("index.php")]
-            bare = path[:-len("/index.php")] or "/"
-            paths = [base + "index.html", path, base, bare]
-        else:
-            paths = [path + "/index.html", path + "/index.php", path + "/", path]
-
-        permutations = set()
-        for scheme in schemes:
-            for host in hosts:
-                port = f":{parsed.port}" if parsed.port else ""
-                netloc = host + port
-                for p in paths:
-                    permutations.add(
-                        urlunparse((scheme, netloc, p, "", parsed.query, ""))
-                    )
-
-        return list(permutations)
-
     async def lock_url(
         self,
         crawl_id: str,
@@ -283,11 +448,7 @@ class CrawlRedis:
         ignore_query_params: bool = False,
         deduplicate_similar: bool = False,
     ) -> bool:
-        """
-        Returns True if the URL was successfully locked (not yet visited).
-        Returns False if already visited or limit reached.
-        """
-        normalized = self.normalize_url(url, ignore_query_params)
+        normalized = normalize_url(url, ignore_query_params)
 
         if limit is not None:
             count = await self.redis.scard(f"crawl:{crawl_id}:visited_unique")
@@ -295,7 +456,7 @@ class CrawlRedis:
                 return False
 
         if deduplicate_similar:
-            visit_key = self.generate_url_permutations(normalized)[0]
+            visit_key = generate_url_permutations(normalized)[0]
         else:
             visit_key = normalized
 
@@ -320,121 +481,7 @@ class CrawlRedis:
 
 
 # ---------------------------------------------------------------------------
-# In-memory store (local-dev fallback — no Redis required)
-# ---------------------------------------------------------------------------
-
-class CrawlMemory:
-    """In-memory crawl state store for local development (no Redis required)."""
-
-    def __init__(self):
-        self._crawls: dict[str, dict] = {}
-        self._active_crawls: set[str] = set()
-        self._jobs: dict[str, set[str]] = {}
-        self._jobs_done: dict[str, set[str]] = {}
-        self._jobs_done_ordered: dict[str, list[tuple[float, str]]] = {}
-        self._visited: dict[str, set[str]] = {}
-        self._visited_unique: dict[str, set[str]] = {}
-        self._finish: set[str] = set()
-        self._kickoff_finish: set[str] = set()
-        self._errors: dict[str, str] = {}
-        self._robots_blocked: dict[str, set[str]] = {}
-
-    async def save_crawl(self, crawl_id: str, crawl: StoredCrawl):
-        self._crawls[crawl_id] = {
-            "origin_url": crawl.origin_url,
-            "crawler_options": crawl.crawler_options.__dict__,
-            "scrape_options": crawl.scrape_options.__dict__,
-            "team_id": crawl.team_id,
-            "robots": crawl.robots,
-            "cancelled": crawl.cancelled,
-            "created_at": crawl.created_at,
-            "zero_data_retention": crawl.zero_data_retention,
-        }
-
-    async def get_crawl(self, crawl_id: str) -> Optional[dict]:
-        return self._crawls.get(crawl_id)
-
-    async def finish_crawl(self, crawl_id: str):
-        self._finish.add(crawl_id)
-        self._active_crawls.discard(crawl_id)
-        self._visited.pop(crawl_id, None)
-        self._visited_unique.pop(crawl_id, None)
-
-    async def set_crawl_error(self, crawl_id: str, error: str):
-        self._errors[crawl_id] = error
-
-    async def mark_crawl_active(self, crawl_id: str):
-        self._active_crawls.add(crawl_id)
-
-    async def add_crawl_job(self, crawl_id: str, job_id: str):
-        self._jobs.setdefault(crawl_id, set()).add(job_id)
-
-    async def add_crawl_jobs(self, crawl_id: str, job_ids: list[str]):
-        if not job_ids:
-            return
-        self._jobs.setdefault(crawl_id, set()).update(job_ids)
-
-    async def add_crawl_job_done(self, crawl_id: str, job_id: str, success: bool):
-        self._jobs_done.setdefault(crawl_id, set()).add(job_id)
-        if success:
-            bisect.insort(self._jobs_done_ordered.setdefault(crawl_id, []), (time.time(), job_id))
-
-    async def get_done_jobs_ordered(self, crawl_id: str, start=0, end=-1) -> list[str]:
-        ordered = self._jobs_done_ordered.get(crawl_id, [])
-        sliced = ordered[start:] if end == -1 else ordered[start:end + 1]
-        return [job_id for _, job_id in sliced]
-
-    async def is_crawl_finished(self, crawl_id: str) -> bool:
-        done = len(self._jobs_done.get(crawl_id, set()))
-        total = len(self._jobs.get(crawl_id, set()))
-        kickoff = crawl_id in self._kickoff_finish
-        return done == total and kickoff
-
-    async def finish_kickoff(self, crawl_id: str):
-        self._kickoff_finish.add(crawl_id)
-
-    @staticmethod
-    def normalize_url(url: str, ignore_query_params: bool = False) -> str:
-        return CrawlRedis.normalize_url(url, ignore_query_params)
-
-    @staticmethod
-    def generate_url_permutations(url: str) -> list[str]:
-        return CrawlRedis.generate_url_permutations(url)
-
-    async def lock_url(
-        self,
-        crawl_id: str,
-        url: str,
-        limit: Optional[int],
-        ignore_query_params: bool = False,
-        deduplicate_similar: bool = False,
-    ) -> bool:
-        normalized = self.normalize_url(url, ignore_query_params)
-
-        if limit is not None:
-            if len(self._visited_unique.get(crawl_id, set())) >= limit:
-                return False
-
-        visit_key = (
-            self.generate_url_permutations(normalized)[0]
-            if deduplicate_similar
-            else normalized
-        )
-
-        visited = self._visited.setdefault(crawl_id, set())
-        if visit_key in visited:
-            return False
-
-        visited.add(visit_key)
-        self._visited_unique.setdefault(crawl_id, set()).add(normalized)
-        return True
-
-    async def record_robots_blocked(self, crawl_id: str, url: str):
-        self._robots_blocked.setdefault(crawl_id, set()).add(url)
-
-
-# ---------------------------------------------------------------------------
-# URL filtering (WebCrawler.filterURL equivalent)
+# URL filtering
 # ---------------------------------------------------------------------------
 
 class UrlFilter:
@@ -453,26 +500,28 @@ class UrlFilter:
 
         origin_host = self.origin.hostname or ""
         target_host = parsed.hostname or ""
+
         if not self.options.allow_subdomains:
-            if not self.options.allow_backward_crawling:
-                if target_host != origin_host and target_host != "www." + origin_host:
-                    return False
+            if target_host != origin_host and target_host != f"www.{origin_host}":
+                return False
 
         if self.options.includes:
-            if not any(re.search(pat, parsed.path) for pat in self.options.includes):
+            if not any(re.search(pattern, parsed.path) for pattern in self.options.includes):
                 return False
 
         if self.options.excludes:
-            if any(re.search(pat, parsed.path) for pat in self.options.excludes):
+            if any(re.search(pattern, parsed.path) for pattern in self.options.excludes):
                 return False
 
         return True
 
+
 # ---------------------------------------------------------------------------
-# Feature flag builder (buildFeatureFlags equivalent)
+# Feature flags
 # ---------------------------------------------------------------------------
 
 DOCUMENT_EXTS = {".docx", ".doc", ".odt", ".rtf", ".xlsx", ".xls"}
+
 
 def build_feature_flags(url: str, options: ScrapeOptions) -> set[FeatureFlag]:
     flags: set[FeatureFlag] = set()
@@ -510,34 +559,73 @@ def build_feature_flags(url: str, options: ScrapeOptions) -> set[FeatureFlag]:
 
     return flags
 
-# ---------------------------------------------------------------------------
-# Scrape engine stub (scrapeURLWithEngine equivalent)
-# ---------------------------------------------------------------------------
-
-async def scrape_with_engine(url: str, engine: str, options: ScrapeOptions) -> dict:
-    """
-    Stub: replace with actual engine calls (httpx fetch, Playwright, Fire Engine, etc.)
-    Returns dict with keys: html, status_code, error, url
-    """
-    import httpx
-    try:
-        async with httpx.AsyncClient(verify=not options.skip_tls_verification, timeout=30) as client:
-            resp = await client.get(url, headers=options.headers or {})
-            return {
-                "html": resp.text,
-                "status_code": resp.status_code,
-                "error": None,
-                "url": str(resp.url),
-            }
-    except Exception as e:
-        return {"html": "", "status_code": 0, "error": str(e), "url": url}
 
 # ---------------------------------------------------------------------------
-# Core scrapeURL function (scrapeURL/index.ts equivalent)
+# Engines
 # ---------------------------------------------------------------------------
 
 ENGINES = ["fetch", "playwright", "fire-engine"]
-WATERFALL_DELAY_S = 3.0
+
+
+async def scrape_with_engine(url: str, engine: str, options: ScrapeOptions) -> dict:
+    """
+    Current implementation:
+    - fetch works
+    - playwright and fire-engine fall back to fetch for now
+    """
+    try:
+        async with httpx.AsyncClient(
+            verify=not options.skip_tls_verification,
+            timeout=(options.timeout or 30000) / 1000,
+            follow_redirects=True,
+        ) as client:
+            response = await client.get(url, headers=options.headers or {})
+            return {
+                "html": response.text,
+                "status_code": response.status_code,
+                "error": None,
+                "url": str(response.url),
+                "engine": engine,
+            }
+    except Exception as e:
+        return {
+            "html": "",
+            "status_code": 0,
+            "error": str(e),
+            "url": url,
+            "engine": engine,
+        }
+
+
+# ---------------------------------------------------------------------------
+# HTML / link extraction
+# ---------------------------------------------------------------------------
+
+def html_to_markdown(html: str) -> Optional[str]:
+    if md is None:
+        return None
+    try:
+        return md(html)
+    except Exception:
+        return None
+
+
+def extract_links(html: str, base_url: str) -> list[str]:
+    pattern = re.compile(r'<a\s[^>]*href=["\']([^"\']+)["\']', re.IGNORECASE)
+    links = []
+
+    for match in pattern.finditer(html):
+        href = match.group(1).strip()
+        if href and not href.startswith(("#", "javascript:", "mailto:", "tel:")):
+            absolute = urljoin(base_url, href)
+            links.append(absolute)
+
+    return list(set(links))
+
+
+# ---------------------------------------------------------------------------
+# Core scrape
+# ---------------------------------------------------------------------------
 
 async def scrape_url(
     scrape_id: str,
@@ -546,27 +634,25 @@ async def scrape_url(
     team_id: str,
     crawl_id: Optional[str] = None,
 ) -> ScrapeResult:
-    """
-    Main scraping function. Tries engines in waterfall order.
-    Returns ScrapeResult with success/document/error.
-    """
     feature_flags = build_feature_flags(url, options)
-    print(f"[{{scrape_id}}] Scraping {{url}} with flags: {{[f.value for f in feature_flags]}}")
+    print(f"[{scrape_id}] Scraping {url} with flags: {[f.value for f in feature_flags]}")
 
     engines_to_try = list(ENGINES)
+
     if FeatureFlag.PDF in feature_flags or FeatureFlag.DOCUMENT in feature_flags:
-        engines_to_try = ["pdf", "fire-engine"]
+        engines_to_try = ["fetch", "playwright", "fire-engine"]
+
     if options.proxy in ("stealth", "enhanced"):
         engines_to_try = ["fire-engine"] + [e for e in engines_to_try if e != "fire-engine"]
 
     last_error: Optional[Exception] = None
 
     for engine in engines_to_try:
-        print(f"[{{scrape_id}}] Trying engine: {{engine}}")
+        print(f"[{scrape_id}] Trying engine: {engine}")
         try:
             engine_result = await asyncio.wait_for(
                 scrape_with_engine(url, engine, options),
-                timeout=(options.timeout or 300_000) / 1000,
+                timeout=(options.timeout or 30000) / 1000,
             )
 
             html = engine_result.get("html", "")
@@ -577,64 +663,60 @@ async def scrape_url(
             if has_content or not is_good_status:
                 document = Document(
                     raw_html=html,
-                    markdown=None,  # TODO: call html-to-markdown here
+                    markdown=html_to_markdown(html) if "markdown" in options.formats else None,
                     metadata={
                         "source_url": url,
                         "url": engine_result.get("url", url),
                         "status_code": status,
                         "engine": engine,
-                    }
+                        "team_id": team_id,
+                        "crawl_id": crawl_id,
+                    },
                 )
-                print(f"[{{scrape_id}}] Engine {{engine}} succeeded (status={{status}})")
+                print(f"[{scrape_id}] Engine {engine} succeeded (status={status})")
                 return ScrapeResult(success=True, document=document)
-            else:
-                raise EngineUnsuccessfulError(engine)
+
+            raise EngineUnsuccessfulError(engine)
 
         except asyncio.TimeoutError:
-            last_error = ScrapeTimeoutError(f"Engine {{engine}} timed out")
-            print(f"[{{scrape_id}}] Engine {{engine}} timed out")
+            last_error = ScrapeTimeoutError(f"Engine {engine} timed out")
+            print(f"[{scrape_id}] Engine {engine} timed out")
         except EngineUnsuccessfulError as e:
             last_error = e
+            print(f"[{scrape_id}] Engine {engine} returned empty content")
         except Exception as e:
             last_error = e
-            print(f"[{{scrape_id}}] Engine {{engine}} error: {{e}}")
+            print(f"[{scrape_id}] Engine {engine} error: {e}")
 
-    print(f"[{{scrape_id}}] All engines failed for {{url}}")
+    print(f"[{scrape_id}] All engines failed for {url}")
     return ScrapeResult(success=False, error=last_error or NoEnginesLeftError(url))
 
-# ---------------------------------------------------------------------------
-# HTML link extractor (filterLinks equivalent)
-# ---------------------------------------------------------------------------
-
-def extract_links(html: str, base_url: str) -> list[str]:
-    """Extract all <a href> links from HTML, resolved to absolute URLs."""
-    from urllib.parse import urljoin
-    pattern = re.compile(r'<a\s[^>]*href=["\']([^"\']+)["\']', re.IGNORECASE)
-    links = []
-    for match in pattern.finditer(html):
-        href = match.group(1).strip()
-        if href and not href.startswith(("#", "javascript:", "mailto:")):
-            absolute = urljoin(base_url, href)
-            links.append(absolute)
-    return list(set(links))
 
 # ---------------------------------------------------------------------------
-# Crawl orchestrator (queue-worker equivalent)
+# Crawler
 # ---------------------------------------------------------------------------
 
 class Crawler:
-    def __init__(self,
+    def __init__(
+        self,
         redis_url: Optional[str] = None,
         max_concurrency: int = 5,
+        store: Optional[CrawlStore] = None,
     ):
-        resolved_url = redis_url or os.environ.get("REDIS_URL", "").strip()
-        if resolved_url:
-            self.store = CrawlRedis(resolved_url)
-            print(f"[crawler] Using Redis store at {resolved_url}")
-        else:
-            self.store = CrawlMemory()
-            print("[crawler] No REDIS_URL set — using in-memory store (local mode)")
         self.max_concurrency = max_concurrency
+
+        if store is not None:
+            self.store = store
+            print("[crawler] Using custom store")
+            return
+
+        redis_url = redis_url or os.getenv("REDIS_URL")
+        if redis_url:
+            self.store = RedisCrawlStore(redis_url)
+            print(f"[crawler] Using Redis store: {redis_url}")
+        else:
+            self.store = InMemoryCrawlStore()
+            print("[crawler] No REDIS_URL set — using in-memory store (local mode)")
 
     async def start_crawl(
         self,
@@ -652,7 +734,7 @@ class Crawler:
         )
         await self.store.save_crawl(crawl_id, crawl)
         await self.store.mark_crawl_active(crawl_id)
-        print(f"[crawl:{{crawl_id}}] Started crawl for {{origin_url}}")
+        print(f"[crawl:{crawl_id}] Started crawl for {origin_url}")
         return crawl_id
 
     async def run_crawl(
@@ -662,7 +744,7 @@ class Crawler:
     ) -> list[Document]:
         crawl_data = await self.store.get_crawl(crawl_id)
         if not crawl_data:
-            raise ValueError(f"Crawl {{crawl_id}} not found")
+            raise ValueError(f"Crawl {crawl_id} not found")
 
         options = CrawlerOptions(**crawl_data["crawler_options"])
         scrape_opts = ScrapeOptions(**crawl_data["scrape_options"])
@@ -674,7 +756,8 @@ class Crawler:
         queue.put_nowait((origin_url, 0))
 
         await self.store.lock_url(
-            crawl_id, origin_url,
+            crawl_id,
+            origin_url,
             limit=options.limit,
             ignore_query_params=options.ignore_query_parameters,
             deduplicate_similar=options.deduplicate_similar_urls,
@@ -697,26 +780,28 @@ class Crawler:
                     crawl_id=crawl_id,
                 )
 
-                success = result.success
-                await self.store.add_crawl_job_done(crawl_id, job_id, success)
+                await self.store.add_crawl_job_done(crawl_id, job_id, result.success)
 
-                if success and result.document:
+                if result.success and result.document:
                     results.append(result.document)
                     if on_document:
                         await on_document(url, result.document)
 
-                    new_urls = extract_links(result.document.raw_html or "", url)
-                    for new_url in new_urls:
-                        if not url_filter.is_allowed(new_url, depth + 1):
-                            continue
-                        locked = await self.store.lock_url(
-                            crawl_id, new_url,
-                            limit=options.limit,
-                            ignore_query_params=options.ignore_query_parameters,
-                            deduplicate_similar=options.deduplicate_similar_urls,
-                        )
-                        if locked:
-                            queue.put_nowait((new_url, depth + 1))
+                    if depth < options.max_depth:
+                        new_urls = extract_links(result.document.raw_html or "", url)
+                        for new_url in new_urls:
+                            if not url_filter.is_allowed(new_url, depth + 1):
+                                continue
+
+                            locked = await self.store.lock_url(
+                                crawl_id,
+                                new_url,
+                                limit=options.limit,
+                                ignore_query_params=options.ignore_query_parameters,
+                                deduplicate_similar=options.deduplicate_similar_urls,
+                            )
+                            if locked:
+                                queue.put_nowait((new_url, depth + 1))
 
         while not queue.empty() or active_tasks:
             while not queue.empty():
@@ -730,16 +815,15 @@ class Crawler:
 
         await self.store.finish_crawl(crawl_id)
         await self.store.finish_kickoff(crawl_id)
-        print(f"[crawl:{{crawl_id}}] Finished. {{len(results)}} pages scraped.")
+        print(f"[crawl:{crawl_id}] Finished. {len(results)} pages scraped.")
         return results
+
 
 # ---------------------------------------------------------------------------
 # Example usage
 # ---------------------------------------------------------------------------
 
 async def main():
-    # No redis_url needed for local development — uses in-memory store by default.
-    # Set REDIS_URL env var to switch to Redis (e.g. for production).
     crawler = Crawler(max_concurrency=3)
 
     crawl_id = await crawler.start_crawl(
@@ -752,16 +836,18 @@ async def main():
         ),
         scrape_options=ScrapeOptions(
             formats=["markdown", "html"],
-            timeout=30_000,
+            timeout=30000,
+            headers={"User-Agent": "FoundationCrawler/0.1"},
         ),
-        team_id="my-team",
+        team_id="local-dev",
     )
 
     async def on_doc(url, doc):
-        print(f"  + {{url}} ({{len(doc.raw_html or '')}} bytes)")
+        print(f"  + {url} ({len(doc.raw_html or '')} bytes)")
 
     docs = await crawler.run_crawl(crawl_id, on_document=on_doc)
-    print(f"\nTotal documents: {{len(docs)}}")
+    print(f"\nTotal documents: {len(docs)}")
+
 
 if __name__ == "__main__":
     asyncio.run(main())
