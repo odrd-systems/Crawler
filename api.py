@@ -1,6 +1,7 @@
+import uuid
 from typing import Optional
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.openapi.docs import get_swagger_ui_html, get_swagger_ui_oauth2_redirect_html
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
@@ -81,56 +82,71 @@ async def swagger_ui_redirect() -> HTMLResponse:
 
 @app.post("/search")
 async def search_endpoint(request: SearchRequest) -> dict:
-    return await search_web(
-        query=request.query,
-        max_results=request.max_results,
-        output_dir=request.output_dir,
-    )
+    try:
+        return await search_web(
+            query=request.query,
+            max_results=request.max_results,
+            output_dir=request.output_dir,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail="Search request failed") from exc
 
 
 @app.post("/crawl")
 async def crawl_endpoint(request: CrawlRequest) -> dict:
-    return await crawl_page(
-        url=request.url,
-        scrape_options=request.scrape_options.to_scrape_options(),
-        team_id=request.team_id,
-        crawl_id=request.crawl_id,
-        output_dir=request.output_dir,
-    )
+    try:
+        return await crawl_page(
+            url=request.url,
+            scrape_options=request.scrape_options.to_scrape_options(),
+            team_id=request.team_id,
+            crawl_id=request.crawl_id,
+            output_dir=request.output_dir,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail="Crawl request failed") from exc
 
 
 @app.post("/search-and-crawl")
 async def search_and_crawl_endpoint(request: SearchAndCrawlRequest) -> dict:
-    search_payload = await search_web(
-        query=request.query,
-        max_results=request.max_results,
-        output_dir=request.output_dir,
-    )
-
-    pages = []
-    base_crawl_id = request.crawl_id or "search-and-crawl"
-    scrape_options = request.scrape_options.to_scrape_options()
-    for item in search_payload.get("results", []):
-        target_url = item.get("url")
-        if not target_url:
-            continue
-        pages.append(
-            await crawl_page(
-                url=target_url,
-                scrape_options=scrape_options,
-                team_id=request.team_id,
-                crawl_id=base_crawl_id,
-                output_dir=request.output_dir,
-            )
+    try:
+        search_payload = await search_web(
+            query=request.query,
+            max_results=request.max_results,
+            output_dir=request.output_dir,
         )
 
-    return {
-        "search": search_payload,
-        "pages": pages,
-        "metadata": {
-            "query": request.query,
-            "result_count": len(search_payload.get("results", [])),
-            "page_count": len(pages),
-            "crawl_id": base_crawl_id,
-        },
-    }
+        pages = []
+        base_crawl_id = request.crawl_id or str(uuid.uuid4())
+        scrape_options = request.scrape_options.to_scrape_options()
+        for item in search_payload.get("results", []):
+            target_url = item.get("url")
+            if not target_url:
+                continue
+            pages.append(
+                await crawl_page(
+                    url=target_url,
+                    scrape_options=scrape_options,
+                    team_id=request.team_id,
+                    crawl_id=base_crawl_id,
+                    output_dir=request.output_dir,
+                )
+            )
+
+        return {
+            "search": search_payload,
+            "pages": pages,
+            "metadata": {
+                "query": request.query,
+                "result_count": len(search_payload.get("results", [])),
+                "page_count": len(pages),
+                "crawl_id": base_crawl_id,
+            },
+        }
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail="Search-and-crawl request failed") from exc

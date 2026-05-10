@@ -854,8 +854,12 @@ def extract_links(html: str, base_url: str) -> list[str]:
 
 
 def save_json(path: str, payload: dict):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
+    resolved_path = os.path.abspath(path)
+    working_dir = os.path.abspath(os.getcwd())
+    if os.path.commonpath([working_dir, resolved_path]) != working_dir:
+        raise ValueError("artifact path must stay within the current working directory")
+    os.makedirs(os.path.dirname(resolved_path), exist_ok=True)
+    with open(resolved_path, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2, ensure_ascii=False)
 
 
