@@ -1,0 +1,136 @@
+from typing import Optional
+
+from fastapi import FastAPI
+from fastapi.openapi.docs import get_swagger_ui_html, get_swagger_ui_oauth2_redirect_html
+from fastapi.responses import HTMLResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, Field
+import swagger_ui_bundle
+
+from crawl_web import crawl_page
+from firecrawl_crawler import ScrapeOptions
+from search_web import search_web
+
+
+app = FastAPI(
+    title="Crawler API",
+    description="Local-first FastAPI wrapper for structured web search and page crawling.",
+    version="0.1.0",
+    docs_url=None,
+    redoc_url=None,
+)
+app.mount("/_swagger", StaticFiles(directory=str(swagger_ui_bundle.swagger_ui_path)), name="swagger")
+
+
+class ScrapeOptionsModel(BaseModel):
+    formats: list[str] = Field(default_factory=lambda: ["markdown", "html"])
+    actions: list[dict] = Field(default_factory=list)
+    wait_for: int = 0
+    timeout: Optional[int] = 30000
+    proxy: Optional[str] = None
+    location: Optional[str] = None
+    mobile: bool = False
+    skip_tls_verification: bool = True
+    block_ads: bool = True
+    max_age: int = 0
+    headers: dict[str, str] = Field(default_factory=dict)
+
+    def to_scrape_options(self) -> ScrapeOptions:
+        return ScrapeOptions(**self.model_dump())
+
+
+class SearchRequest(BaseModel):
+    query: str
+    max_results: int = 10
+    output_dir: str = "output"
+
+
+class CrawlRequest(BaseModel):
+    url: str
+    team_id: str = "local-dev"
+    crawl_id: Optional[str] = None
+    output_dir: str = "output"
+    scrape_options: ScrapeOptionsModel = Field(default_factory=ScrapeOptionsModel)
+
+
+class SearchAndCrawlRequest(BaseModel):
+    query: str
+    max_results: int = 5
+    team_id: str = "local-dev"
+    crawl_id: Optional[str] = None
+    output_dir: str = "output"
+    scrape_options: ScrapeOptionsModel = Field(default_factory=ScrapeOptionsModel)
+
+
+@app.get("/docs", include_in_schema=False)
+async def custom_swagger_ui() -> HTMLResponse:
+    return get_swagger_ui_html(
+        openapi_url=app.openapi_url,
+        title=f"{app.title} - Swagger UI",
+        oauth2_redirect_url=app.swagger_ui_oauth2_redirect_url,
+        swagger_js_url="/_swagger/swagger-ui-bundle.js",
+        swagger_css_url="/_swagger/swagger-ui.css",
+        swagger_favicon_url="",
+    )
+
+
+@app.get(app.swagger_ui_oauth2_redirect_url, include_in_schema=False)
+async def swagger_ui_redirect() -> HTMLResponse:
+    return get_swagger_ui_oauth2_redirect_html()
+
+
+@app.post("/search")
+async def search_endpoint(request: SearchRequest) -> dict:
+    return await search_web(
+        query=request.query,
+        max_results=request.max_results,
+        output_dir=request.output_dir,
+    )
+
+
+@app.post("/crawl")
+async def crawl_endpoint(request: CrawlRequest) -> dict:
+    return await crawl_page(
+        url=request.url,
+        scrape_options=request.scrape_options.to_scrape_options(),
+        team_id=request.team_id,
+        crawl_id=request.crawl_id,
+        output_dir=request.output_dir,
+    )
+
+
+@app.post("/search-and-crawl")
+async def search_and_crawl_endpoint(request: SearchAndCrawlRequest) -> dict:
+    search_payload = await search_web(
+        query=request.query,
+        max_results=request.max_results,
+        output_dir=request.output_dir,
+    )
+
+    pages = []
+    base_crawl_id = request.crawl_id or "search-and-crawl"
+    scrape_options = request.scrape_options.to_scrape_options()
+    for item in search_payload.get("results", []):
+        target_url = item.get("url")
+        if not target_url:
+            continue
+        pages.append(
+            await crawl_page(
+                url=target_url,
+                scrape_options=scrape_options,
+                team_id=request.team_id,
+                crawl_id=base_crawl_id,
+                output_dir=request.output_dir,
+            )
+        )
+
+    return {
+        "search": search_payload,
+        "pages": pages,
+        "metadata": {
+            "query": request.query,
+            "result_count": len(search_payload.get("results", [])),
+            "page_count": len(pages),
+            "crawl_id": base_crawl_id,
+        },
+    }

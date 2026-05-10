@@ -833,6 +833,11 @@ def build_structured_page(url: str, html: str, markdown: Optional[str], metadata
         "text": strip_html_tags(html),
         "markdown": markdown or "",
         "html": html,
+        "links": {
+            "all": links,
+            "internal": internal_links,
+            "external": external_links,
+        },
         "internal_links": internal_links,
         "external_links": external_links,
         "images": _dedupe(images),
@@ -893,6 +898,7 @@ def parse_duckduckgo_results(html: str, max_results: int) -> list[dict]:
                 "title": title,
                 "url": href,
                 "snippet": snippet,
+                "engine": "duckduckgo",
             }
         )
     return items
