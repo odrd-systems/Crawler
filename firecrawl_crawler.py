@@ -24,6 +24,7 @@ from datetime import datetime, timezone
 from html import unescape
 from html.parser import HTMLParser
 from enum import Enum
+from pathlib import Path
 from typing import Optional, Protocol
 from urllib.parse import parse_qs, urljoin, urlparse, urlunparse
 
@@ -678,6 +679,20 @@ def safe_filename(value: str, default: str = "item") -> str:
     return cleaned[:MAX_FILENAME_LENGTH] or default
 
 
+def safe_output_dir(value: str, default: str = "output") -> str:
+    normalized = (value or "").replace("\\", "/").strip()
+    if not normalized:
+        return default
+    parts = [
+        safe_filename(part, default="dir")
+        for part in normalized.split("/")
+        if part not in {"", ".", ".."}
+    ]
+    if not parts:
+        return default
+    return os.path.join(*parts)
+
+
 def _extract_attr_value(attrs: str, attr: str) -> Optional[str]:
     pattern = re.compile(rf'{attr}\s*=\s*["\']([^"\']+)["\']', re.IGNORECASE)
     match = pattern.search(attrs)
@@ -833,6 +848,11 @@ def build_structured_page(url: str, html: str, markdown: Optional[str], metadata
         "text": strip_html_tags(html),
         "markdown": markdown or "",
         "html": html,
+        "links": {
+            "all": links,
+            "internal": internal_links,
+            "external": external_links,
+        },
         "internal_links": internal_links,
         "external_links": external_links,
         "images": _dedupe(images),
@@ -849,8 +869,15 @@ def extract_links(html: str, base_url: str) -> list[str]:
 
 
 def save_json(path: str, payload: dict):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
+    candidate_path = Path(path)
+    filename = candidate_path.name or "item.json"
+    if not filename.endswith(".json"):
+        filename = f"{filename}.json"
+    safe_name = f"{safe_filename(Path(filename).stem, default='item')}.json"
+    safe_dir = safe_output_dir(str(candidate_path.parent), default="output")
+    resolved_path = (Path.cwd().resolve() / safe_dir / safe_name).resolve()
+    resolved_path.parent.mkdir(parents=True, exist_ok=True)
+    with resolved_path.open("w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2, ensure_ascii=False)
 
 
@@ -893,6 +920,7 @@ def parse_duckduckgo_results(html: str, max_results: int) -> list[dict]:
                 "title": title,
                 "url": href,
                 "snippet": snippet,
+                "engine": "duckduckgo",
             }
         )
     return items
@@ -996,9 +1024,9 @@ class Crawler:
         output_dir: str = "output",
     ):
         self.max_concurrency = max_concurrency
-        self.output_dir = output_dir
-        self.page_output_dir = os.path.join(output_dir, "pages")
-        self.search_output_dir = os.path.join(output_dir, "search")
+        self.output_dir = safe_output_dir(output_dir, default="output")
+        self.page_output_dir = os.path.join(self.output_dir, "pages")
+        self.search_output_dir = os.path.join(self.output_dir, "search")
 
         if store is not None:
             self.store = store
@@ -1016,7 +1044,8 @@ class Crawler:
     def _page_artifact_path(self, crawl_id: str, url: str) -> str:
         base = safe_filename(url, default="page")
         digest = hashlib.sha256(url.encode("utf-8")).hexdigest()[:10]
-        return os.path.join(self.page_output_dir, crawl_id, f"{base}-{digest}.json")
+        safe_crawl_id = safe_filename(crawl_id, default="crawl")
+        return os.path.join(self.page_output_dir, safe_crawl_id, f"{base}-{digest}.json")
 
     def save_page_artifact(self, crawl_id: str, document: Document):
         artifact = document.structured_data

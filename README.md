@@ -12,6 +12,7 @@ Foundation Crawler — local-first Python crawler inspired by Firecrawl.
 - Structured per-page JSON artifacts saved during crawling
 - AI-ready page schema with separated text/markdown/html/links/media/documents/metadata
 - DuckDuckGo search → crawl workflow with structured search result JSON output
+- FastAPI API with `/search`, `/crawl`, and `/search-and-crawl`
 - Optional markdown conversion via `markdownify`
 
 ## Setup
@@ -54,9 +55,22 @@ pip install -r requirements.txt
 
 ## Run locally
 
+### CLI crawler example
+
 ```bash
 python firecrawl_crawler.py
 ```
+
+### FastAPI server
+
+```bash
+uvicorn api:app --reload
+```
+
+Then open:
+
+- API docs UI: `http://127.0.0.1:8000/docs` (served locally; no Docker required)
+- OpenAPI JSON: `http://127.0.0.1:8000/openapi.json`
 
 If `REDIS_URL` is **not** set, the crawler runs in **local in-memory mode**.
 
@@ -169,9 +183,73 @@ asyncio.run(main())
 
 `search_and_crawl()` saves search results JSON in `output/search/` and then crawls each search result URL.
 
+## FastAPI endpoints
+
+### `POST /search`
+
+Runs a DuckDuckGo search and returns structured JSON results:
+
+- `query`
+- `engine`
+- `results[]` with `title`, `url`, `snippet`, `engine`
+- `metadata`
+- `artifact_path`
+
+Example:
+
+```bash
+curl -X POST http://127.0.0.1:8000/search \
+  -H "Content-Type: application/json" \
+  -d '{"query":"python asyncio queues","max_results":3}'
+```
+
+### `POST /crawl`
+
+Crawls a single page and returns AI/tool-ready structured JSON with:
+
+- `text`
+- `markdown`
+- `html`
+- `links` (`all`, `internal`, `external`)
+- `images`
+- `audio`
+- `video`
+- `documents`
+- `metadata`
+- `artifact_path`
+
+Example:
+
+```bash
+curl -X POST http://127.0.0.1:8000/crawl \
+  -H "Content-Type: application/json" \
+  -d '{"url":"https://example.com"}'
+```
+
+### `POST /search-and-crawl`
+
+Searches DuckDuckGo, then crawls each result URL as a single page and returns:
+
+- `search` payload
+- `pages[]` structured crawl outputs
+- `metadata`
+
+Example:
+
+```bash
+curl -X POST http://127.0.0.1:8000/search-and-crawl \
+  -H "Content-Type: application/json" \
+  -d '{"query":"python asyncio queues","max_results":2}'
+```
+
+Use `http://127.0.0.1:8000/docs` for an interactive Swagger UI to try each endpoint locally.
+
 ## Architecture
 
 - `Crawler` → main crawl orchestrator
+- `search_web.py` → DuckDuckGo search module plus JSON artifact helper
+- `crawl_web.py` → single-page crawl module plus per-page JSON artifact helper
+- `api.py` → FastAPI app exposing structured local-first endpoints
 - `scrape_url()` → single-page scraping pipeline
 - `build_structured_page()` → AI-ready page extraction (text, markdown, html, links, media, docs, metadata)
 - `search_web()` / `search_and_crawl()` → DuckDuckGo search plus crawl orchestration
@@ -184,6 +262,7 @@ asyncio.run(main())
 
 - `fetch` is the only real engine currently implemented
 - `playwright` and `fire-engine` remain placeholders/stubs for future browser rendering work
+- `crawl_web.py` keeps the single-page crawl interface simple so future Playwright/browser rendering can be added behind it
 - robots.txt is not yet wired in
 - screenshots / actions / advanced Firecrawl engines are not yet implemented
 
@@ -192,6 +271,6 @@ asyncio.run(main())
 Recommended next steps:
 1. Add Playwright support
 2. Add robots.txt support
-3. Add FastAPI endpoints (`/crawl`, `/scrape`, `/map`)
+3. Expand the FastAPI surface area (`/scrape`, `/map`, background jobs)
 4. Add file output / persistence layer
 5. Add page content extraction utilities
