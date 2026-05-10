@@ -535,6 +535,8 @@ DOCUMENT_EXTS = {".docx", ".doc", ".odt", ".rtf", ".xlsx", ".xls"}
 DOCUMENT_LINK_EXTS = DOCUMENT_EXTS.union({".pdf", ".ppt", ".pptx", ".csv", ".txt", ".zip"})
 AUDIO_EXTS = {".mp3", ".wav", ".ogg", ".m4a", ".aac", ".flac"}
 VIDEO_EXTS = {".mp4", ".webm", ".mov", ".mkv", ".m3u8"}
+MAX_FILENAME_LENGTH = 180
+DEFAULT_USER_AGENT = "FoundationCrawler/0.1"
 
 
 def build_feature_flags(url: str, options: ScrapeOptions) -> set[FeatureFlag]:
@@ -640,8 +642,8 @@ def html_to_markdown(html: str) -> Optional[str]:
 
 
 def strip_html_tags(value: str) -> str:
-    value = re.sub(r"<script\b[^>]*>.*?</script>", " ", value, flags=re.IGNORECASE | re.DOTALL)
-    value = re.sub(r"<style\b[^>]*>.*?</style>", " ", value, flags=re.IGNORECASE | re.DOTALL)
+    value = re.sub(r"<script\b[^>]*>.*?</script\s*>", " ", value, flags=re.IGNORECASE | re.DOTALL)
+    value = re.sub(r"<style\b[^>]*>.*?</style\s*>", " ", value, flags=re.IGNORECASE | re.DOTALL)
     value = re.sub(r"<[^>]+>", " ", value)
     value = unescape(value)
     return re.sub(r"\s+", " ", value).strip()
@@ -650,7 +652,7 @@ def strip_html_tags(value: str) -> str:
 def safe_filename(value: str, default: str = "item") -> str:
     cleaned = re.sub(r"^https?://", "", value).strip()
     cleaned = re.sub(r"[^a-zA-Z0-9._-]+", "_", cleaned).strip("._")
-    return cleaned[:180] or default
+    return cleaned[:MAX_FILENAME_LENGTH] or default
 
 
 def _extract_attr_value(attrs: str, attr: str) -> Optional[str]:
@@ -758,9 +760,18 @@ def extract_audio_links(all_links: list[str]) -> list[dict]:
 def extract_video_links(all_links: list[str]) -> list[dict]:
     items = []
     for link in all_links:
-        lower = link.lower()
+        hostname = (urlparse(link).hostname or "").lower()
         path = urlparse(link).path.lower()
-        if any(path.endswith(ext) for ext in VIDEO_EXTS) or "youtube.com" in lower or "youtu.be" in lower or "vimeo.com" in lower:
+        is_video_host = hostname in {
+            "youtube.com",
+            "www.youtube.com",
+            "m.youtube.com",
+            "youtu.be",
+            "vimeo.com",
+            "www.vimeo.com",
+            "player.vimeo.com",
+        }
+        if any(path.endswith(ext) for ext in VIDEO_EXTS) or is_video_host:
             items.append({"url": link, "type": "video"})
     return items
 
@@ -844,7 +855,7 @@ def parse_duckduckgo_results(html: str, max_results: int) -> list[dict]:
     snippets = [strip_html_tags((m.group(1) or m.group(2) or "")) for m in snippet_pattern.finditer(html)]
     items = []
     seen: set[str] = set()
-    for idx, match in enumerate(result_pattern.finditer(html), start=1):
+    for match in result_pattern.finditer(html):
         if len(items) >= max_results:
             break
         href = decode_duckduckgo_result_url(unescape(match.group(1).strip()))
@@ -855,7 +866,7 @@ def parse_duckduckgo_results(html: str, max_results: int) -> list[dict]:
         snippet = snippets[len(items)] if len(snippets) > len(items) else ""
         items.append(
             {
-                "rank": idx,
+                "rank": len(items) + 1,
                 "title": title,
                 "url": href,
                 "snippet": snippet,
@@ -999,7 +1010,7 @@ class Crawler:
 
     async def search_web(self, query: str, max_results: int = 10) -> dict:
         search_url = "https://duckduckgo.com/html/"
-        headers = {"User-Agent": "FoundationCrawler/0.1 (+duckduckgo-search)"}
+        headers = {"User-Agent": f"{DEFAULT_USER_AGENT} (+duckduckgo-search)"}
         results: list[dict] = []
         error: Optional[str] = None
         try:
