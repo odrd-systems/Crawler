@@ -10,7 +10,8 @@ def page_artifact_path(url: str, crawl_id: str, output_dir: str = "output") -> s
     page_output_dir = os.path.join(output_dir, "pages")
     base = safe_filename(url, default="page")
     digest = hashlib.sha256(url.encode("utf-8")).hexdigest()[:10]
-    return os.path.join(page_output_dir, crawl_id, f"{base}-{digest}.json")
+    safe_crawl_id = safe_filename(crawl_id, default="crawl")
+    return os.path.join(page_output_dir, safe_crawl_id, f"{base}-{digest}.json")
 
 
 def save_page_artifact(page: dict, crawl_id: str, output_dir: str = "output") -> str:
@@ -45,14 +46,6 @@ async def crawl_page(
         }
 
     page = dict(result.document.structured_data)
-    page.setdefault(
-        "links",
-        {
-            "all": list(dict.fromkeys((page.get("internal_links") or []) + (page.get("external_links") or []))),
-            "internal": page.get("internal_links") or [],
-            "external": page.get("external_links") or [],
-        },
-    )
 
     artifact_path = save_page_artifact(page=page, crawl_id=effective_crawl_id, output_dir=output_dir)
     response = {

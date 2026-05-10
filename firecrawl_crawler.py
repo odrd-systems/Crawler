@@ -24,6 +24,7 @@ from datetime import datetime, timezone
 from html import unescape
 from html.parser import HTMLParser
 from enum import Enum
+from pathlib import Path
 from typing import Optional, Protocol
 from urllib.parse import parse_qs, urljoin, urlparse, urlunparse
 
@@ -854,12 +855,15 @@ def extract_links(html: str, base_url: str) -> list[str]:
 
 
 def save_json(path: str, payload: dict):
-    resolved_path = os.path.abspath(path)
-    working_dir = os.path.abspath(os.getcwd())
-    if os.path.commonpath([working_dir, resolved_path]) != working_dir:
-        raise ValueError("artifact path must stay within the current working directory")
-    os.makedirs(os.path.dirname(resolved_path), exist_ok=True)
-    with open(resolved_path, "w", encoding="utf-8") as f:
+    working_dir = Path.cwd().resolve()
+    candidate_path = Path(path)
+    resolved_path = candidate_path.resolve() if candidate_path.is_absolute() else (working_dir / candidate_path).resolve()
+    try:
+        resolved_path.relative_to(working_dir)
+    except ValueError as exc:
+        raise ValueError("artifact path must stay within the current working directory") from exc
+    resolved_path.parent.mkdir(parents=True, exist_ok=True)
+    with resolved_path.open("w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2, ensure_ascii=False)
 
 
@@ -1026,7 +1030,8 @@ class Crawler:
     def _page_artifact_path(self, crawl_id: str, url: str) -> str:
         base = safe_filename(url, default="page")
         digest = hashlib.sha256(url.encode("utf-8")).hexdigest()[:10]
-        return os.path.join(self.page_output_dir, crawl_id, f"{base}-{digest}.json")
+        safe_crawl_id = safe_filename(crawl_id, default="crawl")
+        return os.path.join(self.page_output_dir, safe_crawl_id, f"{base}-{digest}.json")
 
     def save_page_artifact(self, crawl_id: str, document: Document):
         artifact = document.structured_data

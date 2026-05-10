@@ -71,7 +71,7 @@ async def custom_swagger_ui() -> HTMLResponse:
         oauth2_redirect_url=app.swagger_ui_oauth2_redirect_url,
         swagger_js_url="/_swagger/swagger-ui-bundle.js",
         swagger_css_url="/_swagger/swagger-ui.css",
-        swagger_favicon_url="",
+        swagger_favicon_url="/_swagger/favicon-32x32.png",
     )
 
 
@@ -89,9 +89,9 @@ async def search_endpoint(request: SearchRequest) -> dict:
             output_dir=request.output_dir,
         )
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail="Search request failed") from exc
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception:
+        raise HTTPException(status_code=500, detail="Search request failed")
 
 
 @app.post("/crawl")
@@ -105,9 +105,9 @@ async def crawl_endpoint(request: CrawlRequest) -> dict:
             output_dir=request.output_dir,
         )
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail="Crawl request failed") from exc
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception:
+        raise HTTPException(status_code=500, detail="Crawl request failed")
 
 
 @app.post("/search-and-crawl")
@@ -147,6 +147,6 @@ async def search_and_crawl_endpoint(request: SearchAndCrawlRequest) -> dict:
             },
         }
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail="Search-and-crawl request failed") from exc
+        raise HTTPException(status_code=400, detail=str(exc))
+    except Exception:
+        raise HTTPException(status_code=500, detail="Search-and-crawl request failed")
