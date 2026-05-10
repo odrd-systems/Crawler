@@ -13,15 +13,18 @@ Current status:
 """
 
 import asyncio
+import hashlib
 import json
 import os
 import re
 import time
 import uuid
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from html import unescape
 from enum import Enum
 from typing import Optional, Protocol
-from urllib.parse import urljoin, urlparse, urlunparse
+from urllib.parse import parse_qs, urljoin, urlparse, urlunparse
 
 import httpx
 
@@ -102,8 +105,16 @@ class StoredCrawl:
 @dataclass
 class Document:
     markdown: Optional[str] = None
+    text: Optional[str] = None
     raw_html: Optional[str] = None
     screenshot: Optional[str] = None
+    internal_links: list[str] = field(default_factory=list)
+    external_links: list[str] = field(default_factory=list)
+    images: list[dict] = field(default_factory=list)
+    audio: list[dict] = field(default_factory=list)
+    video: list[dict] = field(default_factory=list)
+    documents: list[dict] = field(default_factory=list)
+    structured_data: dict = field(default_factory=dict)
     metadata: dict = field(default_factory=dict)
     warning: Optional[str] = None
 
@@ -521,6 +532,9 @@ class UrlFilter:
 # ---------------------------------------------------------------------------
 
 DOCUMENT_EXTS = {".docx", ".doc", ".odt", ".rtf", ".xlsx", ".xls"}
+DOCUMENT_LINK_EXTS = DOCUMENT_EXTS.union({".pdf", ".ppt", ".pptx", ".csv", ".txt", ".zip"})
+AUDIO_EXTS = {".mp3", ".wav", ".ogg", ".m4a", ".aac", ".flac"}
+VIDEO_EXTS = {".mp4", ".webm", ".mov", ".mkv", ".m3u8"}
 
 
 def build_feature_flags(url: str, options: ScrapeOptions) -> set[FeatureFlag]:
@@ -567,6 +581,28 @@ def build_feature_flags(url: str, options: ScrapeOptions) -> set[FeatureFlag]:
 ENGINES = ["fetch", "playwright", "fire-engine"]
 
 
+async def scrape_with_fetch(url: str, options: ScrapeOptions, engine: str) -> dict:
+    async with httpx.AsyncClient(
+        verify=not options.skip_tls_verification,
+        timeout=(options.timeout or 30000) / 1000,
+        follow_redirects=True,
+    ) as client:
+        response = await client.get(url, headers=options.headers or {})
+        return {
+            "html": response.text,
+            "status_code": response.status_code,
+            "error": None,
+            "url": str(response.url),
+            "engine": engine,
+            "content_type": response.headers.get("content-type"),
+        }
+
+
+async def scrape_with_browser_placeholder(url: str, options: ScrapeOptions, engine: str) -> dict:
+    # Extension point for future Playwright / browser-rendered extraction.
+    return await scrape_with_fetch(url, options, engine)
+
+
 async def scrape_with_engine(url: str, engine: str, options: ScrapeOptions) -> dict:
     """
     Current implementation:
@@ -574,19 +610,11 @@ async def scrape_with_engine(url: str, engine: str, options: ScrapeOptions) -> d
     - playwright and fire-engine fall back to fetch for now
     """
     try:
-        async with httpx.AsyncClient(
-            verify=not options.skip_tls_verification,
-            timeout=(options.timeout or 30000) / 1000,
-            follow_redirects=True,
-        ) as client:
-            response = await client.get(url, headers=options.headers or {})
-            return {
-                "html": response.text,
-                "status_code": response.status_code,
-                "error": None,
-                "url": str(response.url),
-                "engine": engine,
-            }
+        if engine == "fetch":
+            return await scrape_with_fetch(url, options, engine)
+        if engine in {"playwright", "fire-engine"}:
+            return await scrape_with_browser_placeholder(url, options, engine)
+        return await scrape_with_fetch(url, options, engine)
     except Exception as e:
         return {
             "html": "",
@@ -594,6 +622,7 @@ async def scrape_with_engine(url: str, engine: str, options: ScrapeOptions) -> d
             "error": str(e),
             "url": url,
             "engine": engine,
+            "content_type": None,
         }
 
 
@@ -610,17 +639,229 @@ def html_to_markdown(html: str) -> Optional[str]:
         return None
 
 
-def extract_links(html: str, base_url: str) -> list[str]:
-    pattern = re.compile(r'<a\s[^>]*href=["\']([^"\']+)["\']', re.IGNORECASE)
-    links = []
+def strip_html_tags(value: str) -> str:
+    value = re.sub(r"<script\b[^>]*>.*?</script>", " ", value, flags=re.IGNORECASE | re.DOTALL)
+    value = re.sub(r"<style\b[^>]*>.*?</style>", " ", value, flags=re.IGNORECASE | re.DOTALL)
+    value = re.sub(r"<[^>]+>", " ", value)
+    value = unescape(value)
+    return re.sub(r"\s+", " ", value).strip()
+
+
+def safe_filename(value: str, default: str = "item") -> str:
+    cleaned = re.sub(r"^https?://", "", value).strip()
+    cleaned = re.sub(r"[^a-zA-Z0-9._-]+", "_", cleaned).strip("._")
+    return cleaned[:180] or default
+
+
+def _extract_attr_value(attrs: str, attr: str) -> Optional[str]:
+    pattern = re.compile(rf'{attr}\s*=\s*["\']([^"\']+)["\']', re.IGNORECASE)
+    match = pattern.search(attrs)
+    if match:
+        return match.group(1).strip()
+    return None
+
+
+def extract_title(html: str) -> Optional[str]:
+    match = re.search(r"<title[^>]*>(.*?)</title>", html, flags=re.IGNORECASE | re.DOTALL)
+    if not match:
+        return None
+    title = strip_html_tags(match.group(1))
+    return title or None
+
+
+def _is_same_domain(origin_host: str, target_host: str) -> bool:
+    origin = (origin_host or "").lower().removeprefix("www.")
+    target = (target_host or "").lower().removeprefix("www.")
+    return bool(origin and target and (target == origin or target.endswith("." + origin)))
+
+
+def extract_link_groups(html: str, base_url: str, page_url: str) -> tuple[list[str], list[str], list[str]]:
+    pattern = re.compile(r'<a\s([^>]*?)href=["\']([^"\']+)["\']([^>]*)>', re.IGNORECASE)
+    links: list[str] = []
+    internal: set[str] = set()
+    external: set[str] = set()
+    page_host = urlparse(page_url).hostname or ""
 
     for match in pattern.finditer(html):
-        href = match.group(1).strip()
-        if href and not href.startswith(("#", "javascript:", "mailto:", "tel:")):
-            absolute = urljoin(base_url, href)
-            links.append(absolute)
+        href = match.group(2).strip()
+        if not href or href.startswith(("#", "javascript:", "mailto:", "tel:", "data:")):
+            continue
+        absolute = urljoin(base_url, href)
+        parsed = urlparse(absolute)
+        if parsed.scheme not in ("http", "https"):
+            continue
+        links.append(absolute)
+        if _is_same_domain(page_host, parsed.hostname or ""):
+            internal.add(absolute)
+        else:
+            external.add(absolute)
 
-    return list(set(links))
+    deduped = list(dict.fromkeys(links))
+    return deduped, sorted(internal), sorted(external)
+
+
+def extract_media_items(
+    html: str,
+    base_url: str,
+    tag: str,
+    attr: str = "src",
+    item_type: str = "media",
+    include_alt_title: bool = False,
+) -> list[dict]:
+    pattern = re.compile(rf"<{tag}\b([^>]*)>", re.IGNORECASE)
+    seen: set[str] = set()
+    items: list[dict] = []
+
+    for match in pattern.finditer(html):
+        attrs = match.group(1)
+        raw = _extract_attr_value(attrs, attr)
+        if not raw:
+            continue
+        absolute = urljoin(base_url, raw)
+        parsed = urlparse(absolute)
+        if parsed.scheme not in ("http", "https"):
+            continue
+        if absolute in seen:
+            continue
+        seen.add(absolute)
+        item = {"url": absolute, "type": item_type}
+        if include_alt_title:
+            alt = _extract_attr_value(attrs, "alt")
+            title = _extract_attr_value(attrs, "title")
+            if alt:
+                item["alt"] = alt
+            if title:
+                item["title"] = title
+        items.append(item)
+
+    return items
+
+
+def extract_document_links(all_links: list[str]) -> list[dict]:
+    items = []
+    for link in all_links:
+        path = urlparse(link).path.lower()
+        if any(path.endswith(ext) for ext in DOCUMENT_LINK_EXTS):
+            items.append({"url": link, "type": "document"})
+    return items
+
+
+def extract_audio_links(all_links: list[str]) -> list[dict]:
+    items = []
+    for link in all_links:
+        path = urlparse(link).path.lower()
+        if any(path.endswith(ext) for ext in AUDIO_EXTS):
+            items.append({"url": link, "type": "audio"})
+    return items
+
+
+def extract_video_links(all_links: list[str]) -> list[dict]:
+    items = []
+    for link in all_links:
+        lower = link.lower()
+        path = urlparse(link).path.lower()
+        if any(path.endswith(ext) for ext in VIDEO_EXTS) or "youtube.com" in lower or "youtu.be" in lower or "vimeo.com" in lower:
+            items.append({"url": link, "type": "video"})
+    return items
+
+
+def build_structured_page(url: str, html: str, markdown: Optional[str], metadata: dict) -> dict:
+    final_url = metadata.get("url", url)
+    links, internal_links, external_links = extract_link_groups(html, final_url, final_url)
+    images = extract_media_items(html, final_url, tag="img", item_type="image", include_alt_title=True)
+    audio = extract_media_items(html, final_url, tag="audio", item_type="audio")
+    audio.extend(extract_media_items(html, final_url, tag="source", item_type="audio"))
+    video = extract_media_items(html, final_url, tag="video", item_type="video")
+    video.extend(extract_media_items(html, final_url, tag="source", item_type="video"))
+    video.extend(extract_media_items(html, final_url, tag="iframe", item_type="video"))
+    documents = extract_document_links(links)
+    audio.extend(extract_audio_links(links))
+    video.extend(extract_video_links(links))
+
+    def _dedupe(items: list[dict]) -> list[dict]:
+        deduped = []
+        seen_urls: set[str] = set()
+        for item in items:
+            link = item.get("url")
+            if not link or link in seen_urls:
+                continue
+            seen_urls.add(link)
+            deduped.append(item)
+        return deduped
+
+    page_metadata = dict(metadata)
+    title = extract_title(html)
+    if title:
+        page_metadata["title"] = title
+
+    return {
+        "url": final_url,
+        "text": strip_html_tags(html),
+        "markdown": markdown or "",
+        "html": html,
+        "internal_links": internal_links,
+        "external_links": external_links,
+        "images": _dedupe(images),
+        "audio": _dedupe(audio),
+        "video": _dedupe(video),
+        "documents": _dedupe(documents),
+        "metadata": page_metadata,
+    }
+
+
+def extract_links(html: str, base_url: str) -> list[str]:
+    links, _, _ = extract_link_groups(html, base_url, base_url)
+    return links
+
+
+def save_json(path: str, payload: dict):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2, ensure_ascii=False)
+
+
+def decode_duckduckgo_result_url(url: str) -> str:
+    parsed = urlparse(url)
+    if "duckduckgo.com" not in (parsed.netloc or "").lower():
+        return url
+    query = parse_qs(parsed.query)
+    redirected = query.get("uddg")
+    if redirected and redirected[0]:
+        return redirected[0]
+    return url
+
+
+def parse_duckduckgo_results(html: str, max_results: int) -> list[dict]:
+    result_pattern = re.compile(
+        r'<a[^>]*class=["\'][^"\']*result__a[^"\']*["\'][^>]*href=["\']([^"\']+)["\'][^>]*>(.*?)</a>',
+        re.IGNORECASE | re.DOTALL,
+    )
+    snippet_pattern = re.compile(
+        r'<a[^>]*class=["\'][^"\']*result__snippet[^"\']*["\'][^>]*>(.*?)</a>|<div[^>]*class=["\'][^"\']*result__snippet[^"\']*["\'][^>]*>(.*?)</div>',
+        re.IGNORECASE | re.DOTALL,
+    )
+
+    snippets = [strip_html_tags((m.group(1) or m.group(2) or "")) for m in snippet_pattern.finditer(html)]
+    items = []
+    seen: set[str] = set()
+    for idx, match in enumerate(result_pattern.finditer(html), start=1):
+        if len(items) >= max_results:
+            break
+        href = decode_duckduckgo_result_url(unescape(match.group(1).strip()))
+        title = strip_html_tags(match.group(2))
+        if not href or href in seen:
+            continue
+        seen.add(href)
+        snippet = snippets[len(items)] if len(snippets) > len(items) else ""
+        items.append(
+            {
+                "rank": idx,
+                "title": title,
+                "url": href,
+                "snippet": snippet,
+            }
+        )
+    return items
 
 
 # ---------------------------------------------------------------------------
@@ -660,7 +901,7 @@ async def scrape_url(
             is_good_status = 200 <= status < 300 or status == 304
             has_content = len(html.strip()) > 0
 
-            if has_content or not is_good_status:
+            if has_content or (not is_good_status and status > 0):
                 document = Document(
                     raw_html=html,
                     markdown=html_to_markdown(html) if "markdown" in options.formats else None,
@@ -671,8 +912,24 @@ async def scrape_url(
                         "engine": engine,
                         "team_id": team_id,
                         "crawl_id": crawl_id,
+                        "content_type": engine_result.get("content_type"),
+                        "engine_error": engine_result.get("error"),
                     },
                 )
+                structured_page = build_structured_page(
+                    url=url,
+                    html=document.raw_html or "",
+                    markdown=document.markdown,
+                    metadata=document.metadata,
+                )
+                document.text = structured_page["text"]
+                document.internal_links = structured_page["internal_links"]
+                document.external_links = structured_page["external_links"]
+                document.images = structured_page["images"]
+                document.audio = structured_page["audio"]
+                document.video = structured_page["video"]
+                document.documents = structured_page["documents"]
+                document.structured_data = structured_page
                 print(f"[{scrape_id}] Engine {engine} succeeded (status={status})")
                 return ScrapeResult(success=True, document=document)
 
@@ -702,8 +959,12 @@ class Crawler:
         redis_url: Optional[str] = None,
         max_concurrency: int = 5,
         store: Optional[CrawlStore] = None,
+        output_dir: str = "output",
     ):
         self.max_concurrency = max_concurrency
+        self.output_dir = output_dir
+        self.page_output_dir = os.path.join(output_dir, "pages")
+        self.search_output_dir = os.path.join(output_dir, "search")
 
         if store is not None:
             self.store = store
@@ -717,6 +978,80 @@ class Crawler:
         else:
             self.store = InMemoryCrawlStore()
             print("[crawler] No REDIS_URL set — using in-memory store (local mode)")
+
+    def _page_artifact_path(self, crawl_id: str, url: str) -> str:
+        base = safe_filename(url, default="page")
+        digest = hashlib.sha1(url.encode("utf-8")).hexdigest()[:10]
+        return os.path.join(self.page_output_dir, crawl_id, f"{base}-{digest}.json")
+
+    def save_page_artifact(self, crawl_id: str, document: Document):
+        artifact = document.structured_data
+        if not artifact:
+            artifact = build_structured_page(
+                url=document.metadata.get("url", ""),
+                html=document.raw_html or "",
+                markdown=document.markdown,
+                metadata=document.metadata,
+            )
+            document.structured_data = artifact
+        path = self._page_artifact_path(crawl_id, artifact.get("url", document.metadata.get("url", "")))
+        save_json(path, artifact)
+
+    async def search_web(self, query: str, max_results: int = 10) -> dict:
+        search_url = "https://duckduckgo.com/html/"
+        headers = {"User-Agent": "FoundationCrawler/0.1 (+duckduckgo-search)"}
+        results: list[dict] = []
+        error: Optional[str] = None
+        try:
+            async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
+                response = await client.get(search_url, params={"q": query}, headers=headers)
+                response.raise_for_status()
+            results = parse_duckduckgo_results(response.text, max_results=max_results)
+        except Exception as exc:
+            error = str(exc)
+
+        payload = {
+            "query": query,
+            "engine": "duckduckgo",
+            "results": results,
+            "metadata": {
+                "fetched_at": datetime.now(timezone.utc).isoformat(),
+                "result_count": len(results),
+                "error": error,
+            },
+        }
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        search_file = os.path.join(self.search_output_dir, f"{safe_filename(query, 'search')}-{stamp}.json")
+        save_json(search_file, payload)
+        return payload
+
+    async def search_and_crawl(
+        self,
+        query: str,
+        team_id: str = "local-dev",
+        max_results: int = 5,
+        crawler_options: Optional[CrawlerOptions] = None,
+        scrape_options: Optional[ScrapeOptions] = None,
+    ) -> dict:
+        search_payload = await self.search_web(query=query, max_results=max_results)
+        crawl_opts = crawler_options or CrawlerOptions(max_depth=0, limit=1, allow_subdomains=True)
+        scrape_opts = scrape_options or ScrapeOptions(formats=["markdown", "html"])
+
+        all_docs: list[Document] = []
+        for item in search_payload.get("results", []):
+            target_url = item.get("url")
+            if not target_url:
+                continue
+            crawl_id = await self.start_crawl(
+                origin_url=target_url,
+                crawler_options=crawl_opts,
+                scrape_options=scrape_opts,
+                team_id=team_id,
+            )
+            docs = await self.run_crawl(crawl_id)
+            all_docs.extend(docs)
+
+        return {"search": search_payload, "documents": all_docs}
 
     async def start_crawl(
         self,
@@ -784,6 +1119,10 @@ class Crawler:
 
                 if result.success and result.document:
                     results.append(result.document)
+                    try:
+                        self.save_page_artifact(crawl_id, result.document)
+                    except Exception as artifact_error:
+                        result.document.warning = f"artifact_save_failed: {artifact_error}"
                     if on_document:
                         await on_document(url, result.document)
 
@@ -843,7 +1182,10 @@ async def main():
     )
 
     async def on_doc(url, doc):
-        print(f"  + {url} ({len(doc.raw_html or '')} bytes)")
+        print(
+            f"  + {url} | text={len(doc.text or '')} chars | "
+            f"images={len(doc.images)} audio={len(doc.audio)} video={len(doc.video)} docs={len(doc.documents)}"
+        )
 
     docs = await crawler.run_crawl(crawl_id, on_document=on_doc)
     print(f"\nTotal documents: {len(docs)}")

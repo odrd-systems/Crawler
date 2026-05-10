@@ -10,3 +10,6 @@ build/
 
 # Environment
 .env
+
+# Local artifacts
+output/
