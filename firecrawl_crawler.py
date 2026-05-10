@@ -679,6 +679,20 @@ def safe_filename(value: str, default: str = "item") -> str:
     return cleaned[:MAX_FILENAME_LENGTH] or default
 
 
+def safe_output_dir(value: str, default: str = "output") -> str:
+    normalized = (value or "").replace("\\", "/").strip()
+    if not normalized:
+        return default
+    parts = [
+        safe_filename(part, default="dir")
+        for part in normalized.split("/")
+        if part not in {"", ".", ".."}
+    ]
+    if not parts:
+        return default
+    return os.path.join(*parts)
+
+
 def _extract_attr_value(attrs: str, attr: str) -> Optional[str]:
     pattern = re.compile(rf'{attr}\s*=\s*["\']([^"\']+)["\']', re.IGNORECASE)
     match = pattern.search(attrs)
@@ -1010,9 +1024,9 @@ class Crawler:
         output_dir: str = "output",
     ):
         self.max_concurrency = max_concurrency
-        self.output_dir = output_dir
-        self.page_output_dir = os.path.join(output_dir, "pages")
-        self.search_output_dir = os.path.join(output_dir, "search")
+        self.output_dir = safe_output_dir(output_dir, default="output")
+        self.page_output_dir = os.path.join(self.output_dir, "pages")
+        self.search_output_dir = os.path.join(self.output_dir, "search")
 
         if store is not None:
             self.store = store

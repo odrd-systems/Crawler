@@ -8,12 +8,13 @@ from firecrawl_crawler import (
     DEFAULT_USER_AGENT,
     parse_duckduckgo_results,
     safe_filename,
+    safe_output_dir,
     save_json,
 )
 
 
 def search_artifact_path(query: str, output_dir: str = "output", stamp: Optional[str] = None) -> str:
-    search_output_dir = os.path.join(output_dir, "search")
+    search_output_dir = os.path.join(safe_output_dir(output_dir, default="output"), "search")
     timestamp = stamp or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     return os.path.join(search_output_dir, f"{safe_filename(query, 'search')}-{timestamp}.json")
 
@@ -35,8 +36,8 @@ async def search_web(query: str, max_results: int = 10, output_dir: str = "outpu
             response = await client.get(search_url, params={"q": query}, headers=headers)
             response.raise_for_status()
         results = parse_duckduckgo_results(response.text, max_results=max_results)
-    except Exception as exc:
-        error = str(exc)
+    except Exception:
+        error = "search_failed"
 
     payload = {
         "query": query,

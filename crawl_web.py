@@ -3,11 +3,11 @@ import os
 import uuid
 from typing import Optional
 
-from firecrawl_crawler import ScrapeOptions, safe_filename, save_json, scrape_url
+from firecrawl_crawler import ScrapeOptions, safe_filename, safe_output_dir, save_json, scrape_url
 
 
 def page_artifact_path(url: str, crawl_id: str, output_dir: str = "output") -> str:
-    page_output_dir = os.path.join(output_dir, "pages")
+    page_output_dir = os.path.join(safe_output_dir(output_dir, default="output"), "pages")
     base = safe_filename(url, default="page")
     digest = hashlib.sha256(url.encode("utf-8")).hexdigest()[:10]
     safe_crawl_id = safe_filename(crawl_id, default="crawl")
@@ -42,7 +42,7 @@ async def crawl_page(
             "success": False,
             "crawl_id": effective_crawl_id,
             "url": url,
-            "error": str(result.error) if result.error else "Unknown crawl error",
+            "error": "crawl_failed",
         }
 
     page = dict(result.document.structured_data)

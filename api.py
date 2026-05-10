@@ -1,10 +1,11 @@
+import logging
+from pathlib import Path
 import uuid
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException
 from fastapi.openapi.docs import get_swagger_ui_html, get_swagger_ui_oauth2_redirect_html
-from fastapi.responses import HTMLResponse
-from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse, HTMLResponse
 from pydantic import BaseModel, Field
 import swagger_ui_bundle
 
@@ -13,6 +14,9 @@ from firecrawl_crawler import ScrapeOptions
 from search_web import search_web
 
 
+logger = logging.getLogger(__name__)
+SWAGGER_UI_DIR = Path(swagger_ui_bundle.swagger_ui_path).resolve()
+
 app = FastAPI(
     title="Crawler API",
     description="Local-first FastAPI wrapper for structured web search and page crawling.",
@@ -20,7 +24,6 @@ app = FastAPI(
     docs_url=None,
     redoc_url=None,
 )
-app.mount("/_swagger", StaticFiles(directory=str(swagger_ui_bundle.swagger_ui_path)), name="swagger")
 
 
 class ScrapeOptionsModel(BaseModel):
@@ -63,6 +66,27 @@ class SearchAndCrawlRequest(BaseModel):
     scrape_options: ScrapeOptionsModel = Field(default_factory=ScrapeOptionsModel)
 
 
+def _swagger_asset_path(filename: str) -> Path:
+    path = (SWAGGER_UI_DIR / filename).resolve()
+    path.relative_to(SWAGGER_UI_DIR)
+    return path
+
+
+@app.get("/_swagger/swagger-ui-bundle.js", include_in_schema=False)
+async def swagger_ui_bundle_js() -> FileResponse:
+    return FileResponse(_swagger_asset_path("swagger-ui-bundle.js"), media_type="text/javascript")
+
+
+@app.get("/_swagger/swagger-ui.css", include_in_schema=False)
+async def swagger_ui_css() -> FileResponse:
+    return FileResponse(_swagger_asset_path("swagger-ui.css"), media_type="text/css")
+
+
+@app.get("/_swagger/favicon-32x32.png", include_in_schema=False)
+async def swagger_ui_favicon() -> FileResponse:
+    return FileResponse(_swagger_asset_path("favicon-32x32.png"), media_type="image/png")
+
+
 @app.get("/docs", include_in_schema=False)
 async def custom_swagger_ui() -> HTMLResponse:
     return get_swagger_ui_html(
@@ -91,6 +115,7 @@ async def search_endpoint(request: SearchRequest) -> dict:
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     except Exception:
+        logger.exception("Search request failed")
         raise HTTPException(status_code=500, detail="Search request failed")
 
 
@@ -107,6 +132,7 @@ async def crawl_endpoint(request: CrawlRequest) -> dict:
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     except Exception:
+        logger.exception("Crawl request failed")
         raise HTTPException(status_code=500, detail="Crawl request failed")
 
 
@@ -149,4 +175,5 @@ async def search_and_crawl_endpoint(request: SearchAndCrawlRequest) -> dict:
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     except Exception:
+        logger.exception("Search-and-crawl request failed")
         raise HTTPException(status_code=500, detail="Search-and-crawl request failed")
