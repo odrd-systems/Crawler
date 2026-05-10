@@ -43,6 +43,7 @@ async def crawl_page(
             "crawl_id": effective_crawl_id,
             "url": url,
             "error": "crawl_failed",
+            "error_type": type(result.error).__name__ if result.error else "UnknownError",
         }
 
     page = dict(result.document.structured_data)

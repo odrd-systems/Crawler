@@ -36,8 +36,8 @@ async def search_web(query: str, max_results: int = 10, output_dir: str = "outpu
             response = await client.get(search_url, params={"q": query}, headers=headers)
             response.raise_for_status()
         results = parse_duckduckgo_results(response.text, max_results=max_results)
-    except Exception:
-        error = "search_failed"
+    except Exception as exc:
+        error = f"search_failed:{type(exc).__name__}"
 
     payload = {
         "query": query,
