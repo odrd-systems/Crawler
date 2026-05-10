@@ -22,6 +22,7 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from html import unescape
+from html.parser import HTMLParser
 from enum import Enum
 from typing import Optional, Protocol
 from urllib.parse import parse_qs, urljoin, urlparse, urlunparse
@@ -641,12 +642,34 @@ def html_to_markdown(html: str) -> Optional[str]:
         return None
 
 
+class _TextExtractor(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self._parts: list[str] = []
+        self._skip_depth = 0
+
+    def handle_starttag(self, tag, attrs):
+        if tag.lower() in {"script", "style"}:
+            self._skip_depth += 1
+
+    def handle_endtag(self, tag):
+        if tag.lower() in {"script", "style"} and self._skip_depth > 0:
+            self._skip_depth -= 1
+
+    def handle_data(self, data):
+        if self._skip_depth == 0:
+            self._parts.append(data)
+
+    def text(self) -> str:
+        return " ".join(self._parts)
+
+
 def strip_html_tags(value: str) -> str:
-    value = re.sub(r"<script\b[^>]*>.*?</script\s*>", " ", value, flags=re.IGNORECASE | re.DOTALL)
-    value = re.sub(r"<style\b[^>]*>.*?</style\s*>", " ", value, flags=re.IGNORECASE | re.DOTALL)
-    value = re.sub(r"<[^>]+>", " ", value)
-    value = unescape(value)
-    return re.sub(r"\s+", " ", value).strip()
+    parser = _TextExtractor()
+    parser.feed(value)
+    parser.close()
+    text = unescape(parser.text())
+    return re.sub(r"\s+", " ", text).strip()
 
 
 def safe_filename(value: str, default: str = "item") -> str:
@@ -992,7 +1015,7 @@ class Crawler:
 
     def _page_artifact_path(self, crawl_id: str, url: str) -> str:
         base = safe_filename(url, default="page")
-        digest = hashlib.sha1(url.encode("utf-8")).hexdigest()[:10]
+        digest = hashlib.sha256(url.encode("utf-8")).hexdigest()[:10]
         return os.path.join(self.page_output_dir, crawl_id, f"{base}-{digest}.json")
 
     def save_page_artifact(self, crawl_id: str, document: Document):
@@ -1010,7 +1033,7 @@ class Crawler:
 
     async def search_web(self, query: str, max_results: int = 10) -> dict:
         search_url = "https://duckduckgo.com/html/"
-        headers = {"User-Agent": f"{DEFAULT_USER_AGENT} (+duckduckgo-search)"}
+        headers = {"User-Agent": f"{DEFAULT_USER_AGENT} (+web-search)"}
         results: list[dict] = []
         error: Optional[str] = None
         try:
