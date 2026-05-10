@@ -9,6 +9,9 @@ Foundation Crawler — local-first Python crawler inspired by Firecrawl.
 - **Uses in-memory state by default**
 - **Uses Redis automatically if `REDIS_URL` is set**
 - Firecrawl-style crawl/job/dedup structure
+- Structured per-page JSON artifacts saved during crawling
+- AI-ready page schema with separated text/markdown/html/links/media/documents/metadata
+- DuckDuckGo search → crawl workflow with structured search result JSON output
 - Optional markdown conversion via `markdownify`
 
 ## Setup
@@ -59,6 +62,11 @@ If `REDIS_URL` is **not** set, the crawler runs in **local in-memory mode**.
 
 If `REDIS_URL` **is** set, it will use Redis automatically.
 
+Structured artifacts are saved automatically under:
+
+- `output/pages/<crawl_id>/*.json` (one JSON file per crawled page)
+- `output/search/*.json` (DuckDuckGo search result payloads)
+
 ## Optional `.env`
 
 Create a `.env` if you want Redis mode:
@@ -108,7 +116,7 @@ async def main():
     )
 
     async def on_doc(url, doc):
-        print(url, doc.metadata)
+        print(url, doc.structured_data["metadata"].get("title"))
 
     docs = await crawler.run_crawl(crawl_id, on_document=on_doc)
     print(f"Scraped {len(docs)} pages")
@@ -116,10 +124,57 @@ async def main():
 asyncio.run(main())
 ```
 
+## AI-ready per-page JSON schema
+
+Each crawled page is represented as a structured artifact:
+
+```json
+{
+  "url": "https://example.com/page",
+  "text": "cleaned plain text",
+  "markdown": "# markdown content",
+  "html": "<html>...</html>",
+  "internal_links": ["https://example.com/about"],
+  "external_links": ["https://external.site/doc"],
+  "images": [{"url": "https://example.com/img.jpg", "type": "image"}],
+  "audio": [{"url": "https://example.com/audio.mp3", "type": "audio"}],
+  "video": [{"url": "https://example.com/video.mp4", "type": "video"}],
+  "documents": [{"url": "https://example.com/report.pdf", "type": "document"}],
+  "metadata": {
+    "url": "https://example.com/page",
+    "status_code": 200,
+    "engine": "fetch",
+    "content_type": "text/html; charset=utf-8"
+  }
+}
+```
+
+## Search → crawl workflow (DuckDuckGo)
+
+```python
+import asyncio
+from firecrawl_crawler import Crawler
+
+async def main():
+    crawler = Crawler(max_concurrency=3)
+    result = await crawler.search_and_crawl(
+        query="python asyncio queues",
+        max_results=3,
+    )
+    print("Search results:", len(result["search"]["results"]))
+    print("Crawled pages:", len(result["documents"]))
+
+asyncio.run(main())
+```
+
+`search_and_crawl()` saves search results JSON in `output/search/` and then crawls each search result URL.
+
 ## Architecture
 
 - `Crawler` → main crawl orchestrator
 - `scrape_url()` → single-page scraping pipeline
+- `build_structured_page()` → AI-ready page extraction (text, markdown, html, links, media, docs, metadata)
+- `search_web()` / `search_and_crawl()` → DuckDuckGo search plus crawl orchestration
 - `InMemoryCrawlStore` → default local state backend
 - `RedisCrawlStore` → optional Redis backend
 - `UrlFilter` → include/exclude/depth/subdomain checks
@@ -128,7 +183,7 @@ asyncio.run(main())
 ## Current limitations
 
 - `fetch` is the only real engine currently implemented
-- `playwright` and `fire-engine` are placeholders/stubs for future work
+- `playwright` and `fire-engine` remain placeholders/stubs for future browser rendering work
 - robots.txt is not yet wired in
 - screenshots / actions / advanced Firecrawl engines are not yet implemented
 
