@@ -68,7 +68,10 @@ class SearchAndCrawlRequest(BaseModel):
 
 def _swagger_asset_path(filename: str) -> Path:
     path = (SWAGGER_UI_DIR / filename).resolve()
-    path.relative_to(SWAGGER_UI_DIR)
+    try:
+        path.relative_to(SWAGGER_UI_DIR)
+    except ValueError as exc:
+        raise RuntimeError("invalid swagger asset path") from exc
     return path
 
 

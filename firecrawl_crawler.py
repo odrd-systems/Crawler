@@ -869,13 +869,13 @@ def extract_links(html: str, base_url: str) -> list[str]:
 
 
 def save_json(path: str, payload: dict):
-    working_dir = Path.cwd().resolve()
     candidate_path = Path(path)
-    resolved_path = candidate_path.resolve() if candidate_path.is_absolute() else (working_dir / candidate_path).resolve()
-    try:
-        resolved_path.relative_to(working_dir)
-    except ValueError as exc:
-        raise ValueError("artifact path must stay within the current working directory") from exc
+    filename = candidate_path.name or "item.json"
+    if not filename.endswith(".json"):
+        filename = f"{filename}.json"
+    safe_name = f"{safe_filename(Path(filename).stem, default='item')}.json"
+    safe_dir = safe_output_dir(str(candidate_path.parent), default="output")
+    resolved_path = (Path.cwd().resolve() / safe_dir / safe_name).resolve()
     resolved_path.parent.mkdir(parents=True, exist_ok=True)
     with resolved_path.open("w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2, ensure_ascii=False)
